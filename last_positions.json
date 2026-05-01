@@ -1,0 +1,50 @@
+{
+  "01_hamburger.png": [
+    3735,
+    68
+  ],
+  "02_dungeon_icon.png": [
+    3484,
+    412
+  ],
+  "03_dungeon_giant.png": [
+    2502,
+    362
+  ],
+  "04_difficulty.png": [
+    2321,
+    681
+  ],
+  "05_private.png": [
+    2085,
+    721
+  ],
+  "06_create_party.png": [
+    3689,
+    952
+  ],
+  "07_confirm.png": [
+    2952,
+    598
+  ],
+  "08_start.png": [
+    3663,
+    246
+  ],
+  "09_notice_confirm.png": [
+    2977,
+    571
+  ],
+  "10_ticket_confirm.png": [
+    2977,
+    571
+  ],
+  "11_auto.png": [
+    3718,
+    828
+  ],
+  "03_dungeon_snake.png": [
+    2169,
+    361
+  ]
+}

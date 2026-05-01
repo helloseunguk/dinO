@@ -1,0 +1,7 @@
+pyautogui>=0.9.54
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+pytesseract>=0.3.10
+mss>=9.0.1
+pydirectinput>=1.0.4

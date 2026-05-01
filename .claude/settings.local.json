@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import macro; print\\('import OK'\\); print\\('throttling opt-out: applied at module load'\\)\")",
+      "Bash(python -c ' *)"
+    ]
+  }
+}

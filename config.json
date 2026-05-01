@@ -1,0 +1,21 @@
+{
+  "dungeon": "giant",
+  "difficulty_text": "극악",
+  "private_text": "비공개 파티",
+  "create_text": "파티 생성",
+  "confirm_text": "확인",
+  "start_text": "시작하기",
+  "match_threshold": 0.8,
+  "step_delay": 1.0,
+  "start_poll_interval": 10.0,
+  "search_timeout": 15.0,
+  "ocr_lang": "kor+eng",
+  "tesseract_path": "",
+  "monitor_index": 2,
+  "max_cycles": 200,
+  "post_entry_min_delay": 10.0,
+  "post_entry_max_delay": 15.0,
+  "dungeon_key": "g",
+  "click_jitter_px": 3,
+  "start_polls_before_fallback": 2
+}
