@@ -156,7 +156,17 @@ class MacroEngine:
         return True
 
     def grab_screen_bgr(self) -> Tuple[np.ndarray, int, int]:
-        """선택된 디스플레이의 화면을 캡처. 반환: (bgr, mon_left, mon_top)"""
+        """선택된 디스플레이의 화면을 캡처. 반환: (bgr, mon_left, mon_top).
+
+        Parsec 등 원격 스트리밍 클라이언트가 background 일 때 다른 창에 가려져
+        스크린샷이 다른 창 픽셀을 잡거나 stale frame 을 잡는 문제를 방지하기 위해,
+        캡처 직전에 게임 창(저장된 시작 버튼 위 윈도우) 을 foreground 로 끌어옴.
+        설정에서 'force_focus_on_capture': false 로 끄면 비활성화."""
+        if self.config.get("force_focus_on_capture", True):
+            if self._focus_game_window():
+                # 포커스 직후엔 클라이언트가 프레임 따라잡을 시간을 줌
+                time.sleep(0.05)
+
         idx = int(self.config.get("monitor_index", 1))
         with mss.mss() as sct:
             mons = sct.monitors
@@ -180,10 +190,14 @@ class MacroEngine:
         return out
 
     def find_image(self, template_path: str, threshold: Optional[float] = None,
-                   region: Optional[Tuple[int, int, int, int]] = None
+                   region: Optional[Tuple[int, int, int, int]] = None,
+                   debug_label: Optional[str] = None,
                    ) -> Optional[Tuple[int, int, int, int, float]]:
-        """멀티 스케일 템플릿 매칭. 반환: (절대x, 절대y, w, h, score) 또는 None"""
+        """멀티 스케일 템플릿 매칭. 반환: (절대x, 절대y, w, h, score) 또는 None.
+        debug_label 지정 시 실패해도 최고 점수/임계값/스케일을 로그로 남김."""
         if not os.path.exists(template_path):
+            if debug_label:
+                self.log(f"  [매칭실패] {debug_label}: 템플릿 파일 없음")
             return None
         thr = threshold if threshold is not None else float(self.config.get("match_threshold", 0.8))
         screen, mon_x, mon_y = self.grab_screen_bgr()
@@ -195,9 +209,13 @@ class MacroEngine:
 
         tmpl = cv2.imread(template_path, cv2.IMREAD_COLOR)
         if tmpl is None:
+            if debug_label:
+                self.log(f"  [매칭실패] {debug_label}: 템플릿 로드 실패")
             return None
 
         best = None
+        best_overall_score = -1.0
+        best_overall_scale = 1.0
         for scale in (1.0, 0.9, 1.1, 0.8, 1.2, 0.7, 1.3):
             if scale != 1.0:
                 t = cv2.resize(tmpl, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
@@ -207,9 +225,16 @@ class MacroEngine:
                 continue
             res = cv2.matchTemplate(screen, t, cv2.TM_CCOEFF_NORMED)
             _, max_val, _, max_loc = cv2.minMaxLoc(res)
+            if max_val > best_overall_score:
+                best_overall_score = float(max_val)
+                best_overall_scale = scale
             if max_val >= thr and (best is None or max_val > best[4]):
                 h, w = t.shape[:2]
                 best = (max_loc[0] + ox, max_loc[1] + oy, w, h, float(max_val))
+        if best is None and debug_label:
+            self.log(f"  [매칭실패] {debug_label}: 최고점수={best_overall_score:.3f} "
+                     f"(임계값={thr:.2f}, 부족분={(thr - best_overall_score):+.3f}, "
+                     f"scale={best_overall_scale:.1f})")
         return best
 
     def wait_image(self, template_path: str, timeout: Optional[float] = None,
@@ -318,9 +343,43 @@ class MacroEngine:
         if jitter > 0:
             x += random.randint(-jitter, jitter)
             y += random.randint(-jitter, jitter)
+
+        # 0) 클릭 좌표 위에 있는 윈도우(예: Parsec)를 foreground 로.
+        #    원격 스트리밍 클라이언트는 자기 창이 활성화돼 있을 때만
+        #    마우스 입력을 원격 호스트로 forward 하므로 매 클릭마다 필수.
+        focused = self._focus_game_window(at_xy=(x, y))
+
+        # 1) 커서를 정확히 위치시킨 뒤 살짝 안정화
         pyautogui.moveTo(x, y, duration=0.1)
-        pyautogui.click()
-        self.log(f"  클릭 위치: ({x}, {y})  [지터 ±{jitter}px]")
+        time.sleep(0.05)
+
+        # 2) mouseDown → 80ms 홀드 → mouseUp.
+        #    pyautogui.click() 은 0ms 홀드라 일부 게임이 무시함.
+        #    pydirectinput 가 있으면 우선 사용 (DirectInput 게임 호환).
+        backend = "pyautogui"
+        try:
+            if HAS_PYDIRECTINPUT:
+                pydirectinput.mouseDown(button="primary", _pause=False)
+                time.sleep(0.08)
+                pydirectinput.mouseUp(button="primary", _pause=False)
+                backend = "pydirectinput"
+            else:
+                pyautogui.mouseDown(button="primary", _pause=False)
+                time.sleep(0.08)
+                pyautogui.mouseUp(button="primary", _pause=False)
+        except Exception as e:
+            self.log(f"  {backend} 클릭 실패 ({e}) → pyautogui.click 폴백")
+            try:
+                pyautogui.click()
+            except Exception as e2:
+                self.log(f"  pyautogui.click 도 실패: {e2}")
+
+        focus_msg = "포커스OK" if focused else "포커스실패"
+        self.log(f"  클릭 위치: ({x}, {y})  "
+                 f"[지터 ±{jitter}px, {backend}, 80ms 홀드, {focus_msg}]")
+
+        # 3) 게임이 클릭을 처리할 시간 확보 후 커서 파킹
+        time.sleep(0.15)
         self._park_cursor()
 
     def _park_cursor(self):
@@ -338,6 +397,44 @@ class MacroEngine:
             pyautogui.moveTo(px, py, duration=0.0)
         except Exception:
             pass
+
+    def _save_debug_screenshot(self, label: str,
+                               click_xy: Optional[Tuple[int, int]] = None,
+                               keep_last: int = 30):
+        """현재 화면을 debug_screenshots/ 에 저장. click_xy 가 주어지면
+        그 위치에 빨간 십자/원 표시. keep_last 개 초과분은 자동 삭제."""
+        try:
+            debug_dir = os.path.join(self.project_dir, "debug_screenshots")
+            os.makedirs(debug_dir, exist_ok=True)
+            screen, mon_x, mon_y = self.grab_screen_bgr()
+            if click_xy is not None:
+                cx = int(click_xy[0]) - mon_x
+                cy = int(click_xy[1]) - mon_y
+                if 0 <= cx < screen.shape[1] and 0 <= cy < screen.shape[0]:
+                    cv2.drawMarker(screen, (cx, cy), (0, 0, 255),
+                                   cv2.MARKER_CROSS, markerSize=80, thickness=4)
+                    cv2.circle(screen, (cx, cy), 50, (0, 0, 255), 3)
+                    cv2.putText(screen, "CLICK", (cx + 60, cy - 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in label)
+            path = os.path.join(debug_dir, f"{ts}_{safe}.png")
+            cv2.imwrite(path, screen)
+            self.log(f"  [디버그] 스크린샷 저장: debug_screenshots/{os.path.basename(path)}")
+
+            # 오래된 파일 자동 정리 (최근 keep_last 개만 유지)
+            files = sorted(
+                (os.path.join(debug_dir, f) for f in os.listdir(debug_dir)
+                 if f.lower().endswith(".png")),
+                key=os.path.getmtime,
+            )
+            for old in files[:-keep_last]:
+                try:
+                    os.remove(old)
+                except Exception:
+                    pass
+        except Exception as e:
+            self.log(f"  [디버그] 스크린샷 저장 실패: {e}")
 
     def click_center(self, box: Tuple[int, ...], save_key: Optional[str] = None):
         x, y, w, h = box[0], box[1], box[2], box[3]
@@ -418,12 +515,15 @@ class MacroEngine:
         self._sleep(float(self.config.get("step_delay", 1.0)))
         return StepResult(True, (tbox[0], tbox[1]))
 
-    def _focus_game_window(self) -> bool:
-        """저장된 시작 버튼 좌표 위에 있는 윈도우를 강제로 포커스로 가져옴."""
+    def _focus_game_window(self, at_xy: Optional[Tuple[int, int]] = None) -> bool:
+        """지정 좌표(또는 저장된 시작 버튼 좌표) 위의 윈도우를 강제로 포커스로 가져옴.
+        Parsec/원격 스트리밍 환경에서 클릭/키 입력이 게임으로 forward 되려면
+        Parsec 창이 foreground 여야 하므로 클릭/키 입력 직전에 호출."""
         if not sys.platform.startswith("win"):
             return False
-        saved = self._last_positions.get("08_start.png")
-        if not saved:
+        if at_xy is None:
+            at_xy = self._last_positions.get("08_start.png")
+        if not at_xy:
             return False
         try:
             import ctypes
@@ -431,7 +531,7 @@ class MacroEngine:
             user32 = ctypes.windll.user32
             kernel32 = ctypes.windll.kernel32
 
-            sx, sy = saved
+            sx, sy = at_xy
             point = wintypes.POINT(int(sx), int(sy))
             hwnd = user32.WindowFromPoint(point)
             if not hwnd:
@@ -449,13 +549,34 @@ class MacroEngine:
             target_thread = user32.GetWindowThreadProcessId(hwnd, None)
             current_thread = kernel32.GetCurrentThreadId()
 
+            # 우회 트릭 1: foreground lock timeout 을 0 으로 (이번 호출 동안만)
+            # 우회 트릭 2: Alt 키를 한 번 톡 → 매크로 프로세스가 입력 이벤트
+            #              발생시킨 것으로 인식돼 SetForegroundWindow 차단 해제.
+            VK_MENU = 0x12
+            KEYEVENTF_KEYUP = 0x0002
+            try:
+                user32.keybd_event(VK_MENU, 0, 0, 0)
+                user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+            except Exception:
+                pass
+
             user32.AttachThreadInput(current_thread, fg_thread, True)
             user32.AttachThreadInput(current_thread, target_thread, True)
             try:
-                SW_RESTORE = 9
-                user32.ShowWindow(hwnd, SW_RESTORE)
+                # 최소화된 경우에만 RESTORE.
+                # 최대화 상태에서 SW_RESTORE 를 부르면 창 크기가 줄어들어
+                # 화면 레이아웃이 바뀌고 미리 잡아둔 좌표가 어긋남.
+                if user32.IsIconic(hwnd):
+                    SW_RESTORE = 9
+                    user32.ShowWindow(hwnd, SW_RESTORE)
                 user32.BringWindowToTop(hwnd)
                 user32.SetForegroundWindow(hwnd)
+                # 우회 트릭 3: 미문서 SwitchToThisWindow 도 시도
+                # SetForegroundWindow 가 silent fail 했을 때 대비.
+                try:
+                    user32.SwitchToThisWindow(hwnd, True)
+                except Exception:
+                    pass
             finally:
                 user32.AttachThreadInput(current_thread, target_thread, False)
                 user32.AttachThreadInput(current_thread, fg_thread, False)
@@ -608,6 +729,7 @@ class MacroEngine:
 
         self.log("[8. 시작하기] 발견 → 클릭")
         self.click_center(box, save_key="08_start.png")
+        last_target = box
 
         strict_thr = max(0.88, float(self.config.get("match_threshold", 0.8)) + 0.05)
         for attempt in range(max_attempts):
@@ -616,13 +738,15 @@ class MacroEngine:
             if not self._sleep(2.0):
                 return False
             if os.path.exists(notice_path):
-                check = self.find_image(notice_path, threshold=strict_thr)
+                check = self.find_image(notice_path, threshold=strict_thr,
+                                        debug_label=f"알림팝업검증(시도{attempt+1}/{max_attempts})")
                 if check:
                     self.log(f"  ✓ 알림 확인 팝업 발견 (score={check[4]:.3f}) "
                              f"→ 시작 버튼 적용 확인")
                     return True
             if os.path.exists(ticket_path):
-                check = self.find_image(ticket_path, threshold=strict_thr)
+                check = self.find_image(ticket_path, threshold=strict_thr,
+                                        debug_label=f"티켓팝업검증(시도{attempt+1}/{max_attempts})")
                 if check:
                     self.log(f"  ✓ 티켓 확인 팝업 발견 (score={check[4]:.3f}) "
                              f"→ 시작 버튼 적용 확인")
@@ -630,10 +754,21 @@ class MacroEngine:
             if attempt < max_attempts - 1:
                 self.log(f"  팝업 미확인 → 시작 버튼 재클릭 "
                          f"({attempt+2}/{max_attempts})")
-                new_box = self.find_image(start_path) if os.path.exists(start_path) else None
+                new_box = self.find_image(
+                    start_path,
+                    debug_label=f"재클릭전 시작버튼 재탐색(시도{attempt+2}/{max_attempts})",
+                ) if os.path.exists(start_path) else None
                 target = new_box if new_box else box
                 self.click_center(target, save_key="08_start.png")
+                last_target = target
         self.log(f"  {max_attempts}회 시도해도 팝업 미확인 → 시작 버튼 클릭 실패로 판단")
+        # 클릭 위치를 표시한 스크린샷 저장 → 화면에 실제로 무엇이 떠 있는지 확인용
+        try:
+            cx = int(last_target[0]) + int(last_target[2]) // 2
+            cy = int(last_target[1]) + int(last_target[3]) // 2
+            self._save_debug_screenshot("click_verify_fail", click_xy=(cx, cy))
+        except Exception:
+            pass
         return False
 
     def _poll_for_start_button(self, poll_interval: float):
@@ -657,7 +792,8 @@ class MacroEngine:
         while not self.stop_event.is_set():
             i += 1
             if os.path.exists(path):
-                box = self.find_image(path)
+                # 매 폴링마다 매칭 실패 점수까지 로그 (시작 버튼 못 찾는 원인 추적)
+                box = self.find_image(path, debug_label=f"시작버튼 폴링#{i}")
                 if box:
                     self.log(f"  [폴링 #{i}] 시작 버튼 이미지 발견 (score={box[4]:.3f})")
                     return ("box", box)
@@ -679,7 +815,10 @@ class MacroEngine:
                 popup_ok = False
                 for p in (notice_path, ticket_path):
                     if os.path.exists(p):
-                        chk = self.find_image(p, threshold=strict_thr)
+                        chk = self.find_image(
+                            p, threshold=strict_thr,
+                            debug_label=f"폴백후 팝업검증({os.path.basename(p)})",
+                        )
                         if chk:
                             self.log(f"  ✓ 팝업 발견 (score={chk[4]:.3f}, "
                                      f"엄격 임계값={strict_thr:.2f}) → 폴백 클릭 성공")
@@ -689,6 +828,8 @@ class MacroEngine:
                     return ("clicked", None)
                 self.log(f"  팝업 미확인 (엄격 임계값 {strict_thr:.2f} 미달) "
                          f"→ 폴백 클릭 무효. 폴링 계속.")
+                self._save_debug_screenshot("fallback_verify_fail",
+                                            click_xy=(sx, sy))
                 consecutive_miss = 0
             now = time.time()
             if now >= next_log_time:

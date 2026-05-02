@@ -5,7 +5,7 @@
   "create_text": "파티 생성",
   "confirm_text": "확인",
   "start_text": "시작하기",
-  "match_threshold": 0.8,
+  "match_threshold": 0.7,
   "step_delay": 1.0,
   "start_poll_interval": 10.0,
   "search_timeout": 15.0,
