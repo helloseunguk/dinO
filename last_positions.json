@@ -8,12 +8,12 @@
     412
   ],
   "03_dungeon_giant.png": [
-    2502,
-    359
+    2503,
+    543
   ],
   "04_difficulty.png": [
-    2321,
-    681
+    3274,
+    271
   ],
   "05_private.png": [
     2085,
@@ -44,7 +44,23 @@
     828
   ],
   "03_dungeon_snake.png": [
-    2169,
+    2172,
+    543
+  ],
+  "03_dungeon_dwarf.png": [
+    2837,
     361
+  ],
+  "04_difficulty_hard.png": [
+    3246,
+    840
+  ],
+  "04_difficulty_normal.png": [
+    2049,
+    679
+  ],
+  "04_difficulty_very_hard.png": [
+    2230,
+    681
   ]
 }

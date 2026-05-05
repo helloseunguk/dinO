@@ -21,7 +21,7 @@ if sys.platform.startswith("win"):
             pass
 
     # Windows 백그라운드 프로세스 자동 throttling(EcoQoS) opt-out.
-    # 매크로 창이 최소화돼도 CPU 클럭이 떨어지지 않도록 함.
+    # 이 프로세스 창이 최소화돼도 CPU 클럭이 떨어지지 않도록 함.
     # 64비트 HANDLE 이 잘리지 않게 argtypes 를 반드시 명시해야 호출 성공.
     try:
         class _PPTState(ctypes.Structure):
@@ -66,7 +66,17 @@ except ImportError:
 
 
 pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0.1
+pyautogui.PAUSE = 0.03  # 기본 0.1 → 0.03 (클릭당 수백 ms 단축)
+
+
+# 난이도 키 → (이미지 파일명, OCR 검색 텍스트)
+# UI/엔진 양쪽에서 공유
+DIFFICULTY_MAP = {
+    "normal":    ("04_difficulty_normal.png",    "보통"),
+    "hard":      ("04_difficulty_hard.png",      "어려움"),
+    "very_hard": ("04_difficulty_very_hard.png", "매우 어려움"),
+    "extreme":   ("04_difficulty_extreme.png",   "극악"),
+}
 
 
 @dataclass
@@ -74,6 +84,8 @@ class StepResult:
     ok: bool
     pos: Optional[Tuple[int, int]] = None
     msg: str = ""
+    no_fallback: bool = False  # True 면 _run_steps 가 저장 좌표 폴백 안 함
+                               # (예: text_only 모드 — 옛 좌표가 다른 항목일 수 있어 위험)
 
 
 class MacroEngine:
@@ -163,9 +175,11 @@ class MacroEngine:
         캡처 직전에 게임 창(저장된 시작 버튼 위 윈도우) 을 foreground 로 끌어옴.
         설정에서 'force_focus_on_capture': false 로 끄면 비활성화."""
         if self.config.get("force_focus_on_capture", True):
-            if self._focus_game_window():
-                # 포커스 직후엔 클라이언트가 프레임 따라잡을 시간을 줌
-                time.sleep(0.05)
+            # 이미 게임 창이 foreground 면 비싼 포커스 작업/슬립 둘 다 스킵
+            if not self._is_game_foreground():
+                if self._focus_game_window():
+                    # 새로 끌어왔을 때만 클라이언트 프레임 따라잡을 시간 줌
+                    time.sleep(0.05)
 
         idx = int(self.config.get("monitor_index", 1))
         with mss.mss() as sct:
@@ -216,6 +230,9 @@ class MacroEngine:
         best = None
         best_overall_score = -1.0
         best_overall_scale = 1.0
+        # scale 1.0 우선 → 좋은 매칭(0.95+) 나오면 즉시 종료. 4K matchTemplate 가
+        # 1회당 100~300ms 라 7회 다 돌면 최대 2초가 걸림. 보통 1.0 에서 잡힘.
+        EARLY_EXIT_SCORE = 0.95
         for scale in (1.0, 0.9, 1.1, 0.8, 1.2, 0.7, 1.3):
             if scale != 1.0:
                 t = cv2.resize(tmpl, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
@@ -231,6 +248,9 @@ class MacroEngine:
             if max_val >= thr and (best is None or max_val > best[4]):
                 h, w = t.shape[:2]
                 best = (max_loc[0] + ox, max_loc[1] + oy, w, h, float(max_val))
+            # 충분히 좋은 매칭이면 나머지 스케일 스킵
+            if best is not None and best[4] >= EARLY_EXIT_SCORE:
+                break
         if best is None and debug_label:
             self.log(f"  [매칭실패] {debug_label}: 최고점수={best_overall_score:.3f} "
                      f"(임계값={thr:.2f}, 부족분={(thr - best_overall_score):+.3f}, "
@@ -347,7 +367,11 @@ class MacroEngine:
         # 0) 클릭 좌표 위에 있는 윈도우(예: Parsec)를 foreground 로.
         #    원격 스트리밍 클라이언트는 자기 창이 활성화돼 있을 때만
         #    마우스 입력을 원격 호스트로 forward 하므로 매 클릭마다 필수.
-        focused = self._focus_game_window(at_xy=(x, y))
+        #    이미 foreground 면 비싼 Alt키/AttachThreadInput 작업 스킵.
+        if self._is_game_foreground((x, y)):
+            focused = True
+        else:
+            focused = self._focus_game_window(at_xy=(x, y))
 
         # 1) 커서를 정확히 위치시킨 뒤 살짝 안정화
         pyautogui.moveTo(x, y, duration=0.1)
@@ -383,18 +407,20 @@ class MacroEngine:
         self._park_cursor()
 
     def _park_cursor(self):
-        """클릭 후 커서를 모니터 우하단 끝으로 옮겨 hover 잔상으로 인한
-        템플릿 매칭 실패를 방지. (0,0) 은 pyautogui FAILSAFE 라 피함."""
+        """클릭 후 커서를 안전한 위치로 옮김 — 기본 OFF.
+
+        예전엔 우하단 코너로 자동 파킹했으나, Windows 11 의 '바탕화면 보기'
+        핫스팟이나 게임 채팅창/퀵메뉴를 트리거하는 부작용이 있어 비활성화.
+        (애초 hover 잔상 이슈는 EcoQoS throttling opt-out 으로 해결됨)
+
+        다시 활성화하려면 config.json 에 안전한 좌표 명시:
+            "park_cursor_xy": [x, y]
+        명시된 좌표가 없으면 아무 동작도 안 함."""
+        custom = self.config.get("park_cursor_xy")
+        if not custom or len(custom) != 2:
+            return
         try:
-            idx = int(self.config.get("monitor_index", 1))
-            with mss.mss() as sct:
-                mons = sct.monitors
-                if idx < 1 or idx >= len(mons):
-                    idx = 1
-                mon = mons[idx]
-            px = int(mon["left"]) + int(mon["width"]) - 2
-            py = int(mon["top"]) + int(mon["height"]) - 2
-            pyautogui.moveTo(px, py, duration=0.0)
+            pyautogui.moveTo(int(custom[0]), int(custom[1]), duration=0.0)
         except Exception:
             pass
 
@@ -471,32 +497,43 @@ class MacroEngine:
 
     def step_click_image_or_text(self, label: str, template_filename: str,
                                  text: str, *, optional: bool = False,
-                                 timeout: Optional[float] = None) -> StepResult:
-        """이미지 우선 시도, 실패하면 텍스트 OCR 로 폴백"""
+                                 timeout: Optional[float] = None,
+                                 text_only: bool = False) -> StepResult:
+        """이미지 우선 시도, 실패하면 텍스트 OCR 로 폴백.
+        text_only=True 면 이미지 단계 건너뛰고 OCR 만 사용 (예: 난이도가 등록된
+        이미지와 다를 때, 이미지가 우연히 매칭되면서 잘못된 항목을 누르는 것 방지)."""
         if self.stop_event.is_set():
             return StepResult(False, msg="중단")
         region = self._get_region(template_filename)
         region_msg = f" [영역={region}]" if region else " [전체화면]"
         opt_msg = "  (선택)" if optional else ""
-        self.log(f"[{label}] 이미지+텍스트 탐색: '{text}'{region_msg}{opt_msg}")
         path = os.path.join(self.images_dir, template_filename)
-        if os.path.exists(path):
-            box = self.find_image(path, region=region)
-            if box:
-                self.log(f"  이미지 발견 (score={box[4]:.3f})")
-                self.click_center(box, save_key=template_filename)
-                self._sleep(float(self.config.get("step_delay", 1.0)))
-                return StepResult(True, (box[0], box[1]))
-            self.log("  이미지 미발견 → 텍스트로 재시도")
+        if text_only:
+            self.log(f"[{label}] 텍스트 전용 탐색: '{text}'{region_msg}{opt_msg}  "
+                     f"[이미지 무시]")
         else:
-            self.log("  (이미지 파일 없음 → 텍스트만 사용)")
+            self.log(f"[{label}] 이미지+텍스트 탐색: '{text}'{region_msg}{opt_msg}")
+            if os.path.exists(path):
+                box = self.find_image(path, region=region)
+                if box:
+                    self.log(f"  이미지 발견 (score={box[4]:.3f})")
+                    self.click_center(box, save_key=template_filename)
+                    self._sleep(float(self.config.get("step_delay", 1.0)))
+                    return StepResult(True, (box[0], box[1]))
+                self.log("  이미지 미발견 → 텍스트로 재시도")
+            else:
+                self.log("  (이미지 파일 없음 → 텍스트만 사용)")
 
         tbox = self.wait_text(text, timeout=timeout, region=region)
         if not tbox:
             if optional:
                 self.log("  미발견 → 선택 단계라 건너뜀")
                 return StepResult(True, msg="skipped")
-            return StepResult(False, msg=f"{label} 텍스트 '{text}' 인식 실패")
+            # text_only 모드면 옛 저장 좌표가 다른 항목(예: 다른 난이도)일 수
+            # 있으니 폴백 차단. 안 막으면 _run_steps 가 옛 좌표를 그대로 클릭.
+            return StepResult(False,
+                              msg=f"{label} 텍스트 '{text}' 인식 실패",
+                              no_fallback=text_only)
         self.log(f"  텍스트 발견")
         self.click_center(tbox, save_key=template_filename)
         self._sleep(float(self.config.get("step_delay", 1.0)))
@@ -514,6 +551,34 @@ class MacroEngine:
         self.click_center(tbox)
         self._sleep(float(self.config.get("step_delay", 1.0)))
         return StepResult(True, (tbox[0], tbox[1]))
+
+    def _is_game_foreground(self, at_xy: Optional[Tuple[int, int]] = None) -> bool:
+        """게임 창(좌표 위 최상위 윈도우) 이 현재 foreground 인지 빠르게 체크만 함.
+        포커스 강탈을 시도하지 않으므로 매우 가벼움 (~수 µs).
+        grab_screen_bgr/_click_xy 가 불필요한 포커스 작업을 스킵할지 결정용."""
+        if not sys.platform.startswith("win"):
+            return False
+        if at_xy is None:
+            at_xy = self._last_positions.get("08_start.png")
+        if not at_xy:
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            sx, sy = at_xy
+            point = wintypes.POINT(int(sx), int(sy))
+            hwnd = user32.WindowFromPoint(point)
+            if not hwnd:
+                return False
+            while True:
+                parent = user32.GetParent(hwnd)
+                if not parent:
+                    break
+                hwnd = parent
+            return user32.GetForegroundWindow() == hwnd
+        except Exception:
+            return False
 
     def _focus_game_window(self, at_xy: Optional[Tuple[int, int]] = None) -> bool:
         """지정 좌표(또는 저장된 시작 버튼 좌표) 위의 윈도우를 강제로 포커스로 가져옴.
@@ -550,7 +615,7 @@ class MacroEngine:
             current_thread = kernel32.GetCurrentThreadId()
 
             # 우회 트릭 1: foreground lock timeout 을 0 으로 (이번 호출 동안만)
-            # 우회 트릭 2: Alt 키를 한 번 톡 → 매크로 프로세스가 입력 이벤트
+            # 우회 트릭 2: Alt 키를 한 번 톡 → 이 프로세스가 입력 이벤트
             #              발생시킨 것으로 인식돼 SetForegroundWindow 차단 해제.
             VK_MENU = 0x12
             KEYEVENTF_KEYUP = 0x0002
@@ -605,6 +670,10 @@ class MacroEngine:
         """던전 진입 직후: 5~10초 랜덤 대기 → 시작 버튼 미발견 2회 확인 → 지정 키 입력."""
         if self.stop_event.is_set():
             return
+        # 자동 키 입력 비활성화 시 대기/체크/키입력 전부 스킵
+        if not self.config.get("auto_press_dungeon_key", True):
+            self.log("[던전 진입 후] 자동 키 입력 비활성화 - 키 입력 생략")
+            return
         min_d = float(self.config.get("post_entry_min_delay", 5.0))
         max_d = float(self.config.get("post_entry_max_delay", 10.0))
         if max_d < min_d:
@@ -644,7 +713,8 @@ class MacroEngine:
             self.log(f"  키 입력 실패: {e}")
 
     def _run_steps(self, steps) -> bool:
-        """각 단계 1회 시도. 실패 시 즉시 저장된 좌표로 폴백."""
+        """각 단계 1회 시도. 실패 시 즉시 저장된 좌표로 폴백.
+        StepResult.no_fallback=True 면 폴백 차단 (옛 좌표가 다른 항목일 수 있을 때)."""
         for entry in steps:
             if len(entry) == 3:
                 label, fn, key = entry
@@ -656,6 +726,9 @@ class MacroEngine:
             r = fn()
             if r.ok:
                 continue
+            if r.no_fallback:
+                self.log(f"  → 실패 (폴백 차단됨, 옛 좌표 클릭 위험): {r.msg}")
+                return False
             saved = self._last_positions.get(key) if key else None
             if saved:
                 px, py = saved
@@ -678,6 +751,9 @@ class MacroEngine:
         }
         selected = cfg.get("dungeon", "snake")
         dungeon_img, dungeon_text = dungeon_map.get(selected, dungeon_map["snake"])
+        # 난이도별 이미지/텍스트 매핑
+        diff_key = cfg.get("difficulty", "extreme")
+        diff_img, diff_text = DIFFICULTY_MAP.get(diff_key, DIFFICULTY_MAP["extreme"])
         confirm_text = cfg.get("confirm_text", "확인")
         start_text = cfg.get("start_text", "시작하기")
 
@@ -691,10 +767,10 @@ class MacroEngine:
             (f"3. 던전 선택({dungeon_text})",
              lambda: self.step_click_image_or_text(f"3. 던전 선택", dungeon_img, dungeon_text),
              dungeon_img),
-            ("4. 극악",
-             lambda: self.step_click_image_or_text("4. 극악", "04_difficulty.png",
-                                                   cfg.get("difficulty_text", "극악")),
-             "04_difficulty.png"),
+            (f"4. 난이도({diff_text})",
+             lambda: self.step_click_image_or_text(
+                 f"4. 난이도({diff_text})", diff_img, diff_text),
+             diff_img),
             ("5. 비공개 파티",
              lambda: self.step_click_image_or_text("5. 비공개 파티", "05_private.png",
                                                    cfg.get("private_text", "비공개 파티")),
@@ -731,11 +807,13 @@ class MacroEngine:
         self.click_center(box, save_key="08_start.png")
         last_target = box
 
-        strict_thr = max(0.88, float(self.config.get("match_threshold", 0.8)) + 0.05)
+        strict_thr = float(self.config.get(
+            "popup_verify_threshold",
+            max(0.85, float(self.config.get("match_threshold", 0.8)) + 0.05)))
         for attempt in range(max_attempts):
             if self.stop_event.is_set():
                 return False
-            if not self._sleep(2.0):
+            if not self._sleep(1.2):  # 게임이 팝업 띄우기까지 기다림. 2.0 → 1.2 단축
                 return False
             if os.path.exists(notice_path):
                 check = self.find_image(notice_path, threshold=strict_thr,
@@ -797,7 +875,10 @@ class MacroEngine:
                 if box:
                     self.log(f"  [폴링 #{i}] 시작 버튼 이미지 발견 (score={box[4]:.3f})")
                     return ("box", box)
-            if i % 3 == 0:
+            # OCR (find_text) 호출 제거: 4K 화면 OCR 은 1~3초 걸리는데
+            # 이미지 매칭이 실패할 때 OCR 도 거의 항상 실패해서 무용. 큰 시간 낭비.
+            # 시작 버튼 텍스트가 필요하면 config 의 'use_ocr_for_polling': true 로 활성화.
+            if self.config.get("use_ocr_for_polling", False) and i % 3 == 0:
                 tbox = self.find_text(start_text)
                 if tbox:
                     self.log(f"  [폴링 #{i}] 시작 버튼 텍스트 발견")
@@ -809,9 +890,11 @@ class MacroEngine:
                          f"→ 저장 좌표 ({sx}, {sy}) 클릭 시도")
                 self._click_xy(sx, sy)
                 fallback_used = True
-                if not self._sleep(2.5):
+                if not self._sleep(1.5):  # 2.5 → 1.5 단축
                     return None
-                strict_thr = max(0.88, float(self.config.get("match_threshold", 0.8)) + 0.05)
+                strict_thr = float(self.config.get(
+                    "popup_verify_threshold",
+                    max(0.85, float(self.config.get("match_threshold", 0.8)) + 0.05)))
                 popup_ok = False
                 for p in (notice_path, ticket_path):
                     if os.path.exists(p):
@@ -860,7 +943,7 @@ class MacroEngine:
         return self._run_steps(steps)
 
     def _set_keep_awake(self, enable: bool):
-        """매크로 실행 중 디스플레이/시스템이 절전으로 가지 않도록 유지."""
+        """실행 중 디스플레이/시스템이 절전으로 가지 않도록 유지."""
         if not sys.platform.startswith("win"):
             return
         try:
@@ -886,6 +969,13 @@ class MacroEngine:
     def _run_loop_inner(self):
         self.log("=" * 50)
         self.log("python_study 시작")
+        # 관리자 권한 여부 표시 (포커스 강탈 가능 여부에 결정적)
+        if sys.platform.startswith("win"):
+            try:
+                is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+                self.log(f"  실행 권한: {'관리자(Admin)' if is_admin else '일반 사용자 (포커스 강탈 제한됨)'}")
+            except Exception:
+                self.log("  실행 권한: 확인 실패")
         self.log("=" * 50)
 
         max_cycles = int(self.config.get("max_cycles", 0))

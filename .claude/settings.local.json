@@ -2,7 +2,16 @@
   "permissions": {
     "allow": [
       "Bash(python -c \"import macro; print\\('import OK'\\); print\\('throttling opt-out: applied at module load'\\)\")",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import sv_ttk; print\\('sv_ttk OK', sv_ttk.__version__ if hasattr\\(sv_ttk, '__version__'\\) else ''\\)\")",
+      "Bash(pip install *)",
+      "Bash(python -c \"import sys; print\\('python:', sys.executable\\); import subprocess; print\\(\\); subprocess.run\\([sys.executable, '-m', 'pip', 'show', 'sv-ttk']\\)\")",
+      "Bash(where pythonw *)",
+      "Bash(where python *)",
+      "Bash(pythonw -c \"import sys; print\\('pythonw:', sys.executable\\)\")",
+      "Bash(\"C:\\\\Users\\\\HAN\\\\AppData\\\\Local\\\\Python\\\\pythoncore-3.14-64\\\\python.exe\" -m pip install sv-ttk)",
+      "Bash('C:\\\\Users\\\\HAN\\\\AppData\\\\Local\\\\Python\\\\pythoncore-3.14-64\\\\python.exe' -c ' *)",
+      "Bash('C:\\\\Users\\\\HAN\\\\AppData\\\\Local\\\\Python\\\\pythoncore-3.14-64\\\\python.exe' -X utf8 -c ' *)"
     ]
   }
 }
