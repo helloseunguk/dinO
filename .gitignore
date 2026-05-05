@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller build output
+build/
+dist/
+
+# Runtime-generated data
+boss_times.json
+automation_targets.json
+alert_settings.json
+auth.json
+app.log
+
+# Secrets — 레포에 절대 커밋 금지
+discord_secret.txt
+
+# Debug dumps
+boss_debug/
+ocr_debug/
+
+# IDE / OS
+.vscode/settings.json
+.DS_Store
+Thumbs.db

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python test_m_ocr.py --help)",
+      "Bash(python -c \"import cv2; print\\('cv2 version:', cv2.__version__\\)\")",
+      "Bash(python test_boss_presence.py --help)",
+      "Bash(python -u -c ' *)"
+    ]
+  }
+}
