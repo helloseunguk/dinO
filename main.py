@@ -76,31 +76,31 @@ _set_dpi_awareness()
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
-import boss_store
-import ocr_engine
-from automation_config import (
+from odin.boss import boss_store
+from odin.game import ocr_engine
+from odin.automation.automation_config import (
     load_runtime_targets, load_runtime_presets, load_runtime_settings)
-from boss_config import BOSS_CONFIGS, CHECK_INTERVAL
-from paths import BUNDLED_DIR
+from odin.boss.boss_config import BOSS_CONFIGS, CHECK_INTERVAL
+from odin.core.paths import BUNDLED_DIR
 
 # 자동화 우선순위 / 스킬 프리셋 커스텀 저장 있으면 로드
 load_runtime_targets()
 load_runtime_presets()
 load_runtime_settings()   # 우선순위 적용 토글
-from models import BossState
-from notifier import CompositeNotifier, DiscordNotifier, GuiNotifier, LogNotifier, SystemNotifier
-from screen_sync import ScreenSync
-from api_sync import ApiSync
-from notice_watcher import NoticeWatcher
-from scheduler import BossScheduler
-from automator import BossAutomator
-from game_queue import GameTaskQueue
-from exp_tracker import ExpTracker
-from presence_monitor import PresenceMonitor
-from gui import MainWindow
+from odin.core.models import BossState
+from odin.notify.notifier import CompositeNotifier, DiscordNotifier, GuiNotifier, LogNotifier, SystemNotifier
+from odin.sync.screen_sync import ScreenSync
+from odin.sync.api_sync import ApiSync
+from odin.notify.notice_watcher import NoticeWatcher
+from odin.boss.scheduler import BossScheduler
+from odin.automation.automator import BossAutomator
+from odin.core.game_queue import GameTaskQueue
+from odin.exp.exp_tracker import ExpTracker
+from odin.boss.presence_monitor import PresenceMonitor
+from odin.ui.gui import MainWindow
 
 
-from paths import DATA_DIR as _DATA_DIR_FOR_LOG
+from odin.core.paths import DATA_DIR as _DATA_DIR_FOR_LOG
 
 _LOG_FILE = _DATA_DIR_FOR_LOG / "app.log"
 logging.basicConfig(
@@ -264,7 +264,7 @@ def main():
 
     bosses = create_bosses()
     # 저장된 알림 트리거 시간 적용 (1/3/5분)
-    from alert_settings import load_alert_minutes, apply_to_bosses
+    from odin.notify.alert_settings import load_alert_minutes, apply_to_bosses
     apply_to_bosses(bosses, load_alert_minutes())
 
     screen_sync = ScreenSync()          # 수동 동기화 버튼 (OCR)

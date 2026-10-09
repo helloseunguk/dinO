@@ -11,5 +11,5 @@ if not exist "%~dp0.venv\Scripts\python.exe" (
     exit /b 1
 )
 
-"%~dp0.venv\Scripts\python.exe" "%~dp0ocr_sync.py" --test %*
+"%~dp0.venv\Scripts\python.exe" -m odin.sync.ocr_sync --test %*
 pause
