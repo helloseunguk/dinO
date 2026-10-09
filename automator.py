@@ -24,7 +24,9 @@ import numpy as np
 from PIL import Image
 from PySide6.QtCore import QObject, Signal, Slot
 
-from automation_config import REGION_PRIORITY, is_automation_target, priority_key
+from automation_config import (
+    REGION_PRIORITY, is_automation_target, is_priority_enabled, order_key,
+    priority_key)
 from boss_config import TAB_BOSS_MAP, TAB_TIME_COORDS
 from game_coords import (
     find_game_window, scale_xy,
@@ -54,6 +56,7 @@ _REGION_TO_TAB = {
     "무스펠": "무스펠하임",
     "아스":   "아스가르드",
     "니플":   "니플하임",
+    "바나":   "바나하임",
     "던전":   "던전",
     "미드":   "미드가르드",
 }
@@ -174,6 +177,17 @@ M_ABSENCE_FORCE_PHASE2_SEC = 15.0
 # 'A' 전략: Phase 2 에서 EMPTY_CONFIRM_COUNT 달성 후 이 시간 동안 2차 확인.
 # 이 동안 m 이 다시 나타나면 도착 판정 취소하고 Phase 2 계속.
 FINAL_CONFIRM_WAIT_SEC = 3.0
+
+# === 도착 확정 후 홀드 (보스별) ===
+# 여기에 등록된 보스는 도착 판정이 끝나도 G+F 를 바로 누르지 않고
+# "스폰 N초 전" 까지 대기한 뒤 진행. 출발 시점(SOON = alert_before)은 그대로.
+# 주의: game_queue 가 직렬이라 홀드 동안 다른 보스 자동화가 밀림
+#       → 동시 SOON 이 드문 보스에만 지정할 것.
+ARRIVAL_HOLD_BEFORE_SPAWN_SEC: dict[str, float] = {
+    "수르트": 30.0,
+}
+# 홀드 상한 — 스폰 시각이 잘못 잡혔을 때 큐가 무한정 막히는 것 방지
+ARRIVAL_HOLD_MAX_SEC = 180.0
 
 # === 미니맵 정지 감지 (도착 빠른 판정 보조) ===
 # 미니맵을 매 폴링마다 캡처해 직전 프레임과 cv2.absdiff → 이진화 → 변경 픽셀 비율로
@@ -390,6 +404,9 @@ def _run_sequence(boss: BossState, screen_sync):
 
         # 도착 직후 settle — 게임이 G/F 입력을 안정적으로 받도록 짧은 대기
         _sleep_cancellable(0.5)
+
+        # 보스별 도착 홀드 — 지정된 보스만 스폰 N초 전까지 대기 (수르트 등)
+        _hold_until_pre_spawn(boss)
 
         # 7) G 키 입력
         _press_key(_VK_G)
@@ -653,6 +670,34 @@ def _wait_until_arrival(abs_region: dict,
             _sleep_cancellable(POLL_INTERVAL_SEC)
 
 
+def _hold_until_pre_spawn(boss: BossState):
+    """ARRIVAL_HOLD_BEFORE_SPAWN_SEC 에 등록된 보스만, 도착 확정 후
+    '스폰 N초 전' 까지 대기. 미등록 보스는 즉시 반환 (기존 동작 그대로).
+    """
+    hold_sec = ARRIVAL_HOLD_BEFORE_SPAWN_SEC.get(boss.config.name)
+    if hold_sec is None:
+        return
+    if boss.next_spawn_at is None:
+        logger.info("[자동화] %s: 스폰 시각 미상 — 도착 홀드 스킵",
+                    boss.config.display_name)
+        return
+    target = boss.next_spawn_at - timedelta(seconds=hold_sec)
+    wait = (target - datetime.now()).total_seconds()
+    if wait <= 0:
+        logger.info("[자동화] %s: 이미 스폰 %.0fs 전 이내 — 홀드 없이 진행",
+                    boss.config.display_name, hold_sec)
+        return
+    if wait > ARRIVAL_HOLD_MAX_SEC:
+        logger.warning("[자동화] %s: 홀드 요구 %.0fs — 상한 %.0fs 로 제한",
+                       boss.config.display_name, wait, ARRIVAL_HOLD_MAX_SEC)
+        wait = ARRIVAL_HOLD_MAX_SEC
+    logger.info("[자동화] %s: 도착 완료 — 스폰 %.0fs 전(%s)까지 %.1fs 홀드",
+                boss.config.display_name, hold_sec,
+                target.strftime("%H:%M:%S"), wait)
+    _sleep_cancellable(wait)      # Ctrl+Esc 로 중단 가능
+    logger.info("[자동화] %s: 홀드 종료 → G+F 진행", boss.config.display_name)
+
+
 def _read_m_region(img_gray: np.ndarray) -> str:
     """OCR 전체 텍스트 반환 (Windows OCR 기반)."""
     return ocr_text(img_gray)
@@ -888,6 +933,12 @@ QUEUE_SKIP_MIN_REMAINING_SEC = 40.0
 # 남아 있으면 원래 타겟 대신 그 보스로 먼저 이동.
 SWAP_CHECK_THRESHOLD_SEC = 240.0   # 4분
 
+# 연탐 판정 — 다음 자동화 대상 보스가 이 시간 이내로 붙어 있으면 "연탐" 으로 보고
+# presence 추적의 미감지 유예를 단축한다 (presence_monitor.FAST_SPAWN_GRACE_SEC).
+# 사이트/API 가 분 단위로만 시각을 주고 겹침보정이 +1초씩 벌리므로 간격이 수 초인
+# 경우가 흔하다 — 그럴 때 10초짜리 기본 창을 기다리면 다음 보스를 놓친다.
+CHAIN_GAP_SEC = 60.0
+
 
 class BossAutomator(QObject):
     """SOON 이벤트 시 자동화 시퀀스를 공용 큐에 적재.
@@ -942,6 +993,18 @@ class BossAutomator(QObject):
         # Ctrl+Esc 로 대기열·추적·상태 전부 초기화
         register_esc_callback(self._on_esc_pressed)
 
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def current_boss(self) -> BossState | None:
+        return self._current_boss
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
     def reset(self):
         """상태 강제 초기화 — 꼬인 상태(RUNNING/TRACKING 에 갇힘 등) 해제용.
         _pending 비움 + _state=IDLE + presence 추적 중단 + _current_boss=None.
@@ -980,8 +1043,8 @@ class BossAutomator(QObject):
             if boss in self._pending:
                 return  # 중복 방지
             self._pending.append(boss)
-            # priority_key 작을수록 높은 우선순위 → ASC 정렬로 앞쪽이 고우선순위
-            self._pending.sort(key=lambda b: priority_key(b.config))
+            # order_key ASC — 우선순위 ON 이면 고우선순위가, OFF 면 스폰이 빠른 쪽이 앞
+            self._pending.sort(key=order_key)
             current_name = (self._current_boss.config.display_name
                             if self._current_boss else "?")
             pos = self._pending.index(boss) + 1
@@ -994,30 +1057,39 @@ class BossAutomator(QObject):
         # 시작 전 스왑 체크 — 우선순위가 더 높고 5분 이내 남은 보스가 있으면 그쪽 먼저
         better = self._find_better_target(boss)
         if better is not None:
+            if is_priority_enabled():
+                reason = (f"우선순위 {priority_key(better.config)} < "
+                          f"{priority_key(boss.config)}")
+            else:
+                reason = "스폰이 더 빠름"
             logger.info(
-                "[자동화] 시작 전 스왑: '%s' → '%s' (우선순위 %s < %s, 남은 %.1f분)",
+                "[자동화] 시작 전 스왑: '%s' → '%s' (%s, 남은 %.1f분)",
                 boss.config.display_name,
                 better.config.display_name,
-                priority_key(better.config),
-                priority_key(boss.config),
+                reason,
                 better.remaining_time.total_seconds() / 60)
             # 원래 보스는 pending 으로 — 스왑 대상이 끝난 뒤 재시도
             if boss not in self._pending:
                 self._pending.append(boss)
-                self._pending.sort(key=lambda b: priority_key(b.config))
+                self._pending.sort(key=order_key)
             boss = better
 
         self._submit(boss)
 
     def _find_better_target(self, current: BossState) -> BossState | None:
-        """all_bosses 중 current 보다 우선순위가 높고 <5분 남은 자동화 타겟을 탐색.
-        여러 개면 최고 우선순위 하나 반환. 없으면 None.
+        """current 보다 먼저 가야 할 보스 탐색 (<4분 남은 자동화 타겟 중에서).
+
+        우선순위 ON  — 더 높은 우선순위인 보스
+        우선순위 OFF — 더 빨리 스폰하는 보스
+        없으면 None.
         """
         if not self.all_bosses:
             return None
-        cur_key = priority_key(current.config)
+        priority_on = is_priority_enabled()
+        cur_rem = current.remaining_time
         best: BossState | None = None
-        best_key = cur_key
+        best_key = priority_key(current.config)
+        best_sec = cur_rem.total_seconds() if cur_rem is not None else float("inf")
         for b in self.all_bosses:
             if b is current:
                 continue
@@ -1029,11 +1101,36 @@ class BossAutomator(QObject):
             sec = rem.total_seconds()
             if sec <= 0 or sec >= SWAP_CHECK_THRESHOLD_SEC:
                 continue
-            b_key = priority_key(b.config)
-            if b_key < best_key:
+            if priority_on:
+                b_key = priority_key(b.config)
+                if b_key < best_key:
+                    best = b
+                    best_key = b_key
+            elif sec < best_sec:
                 best = b
-                best_key = b_key
+                best_sec = sec
         return best
+
+    def _is_chain_boss(self, boss: BossState) -> bool:
+        """연탐 여부 — 다른 자동화 대상이 CHAIN_GAP_SEC 이내로 붙어 있는지.
+
+        도착 시점(=대략 스폰 시각)에 판정한다. 추적 중인 보스 자신의 next_spawn_at 은
+        스폰이 지나면 advance_to_next_spawn 으로 다음 주기까지 밀리므로 기준이 될 수
+        없어, '지금부터 남은 시간' 으로 본다.
+        """
+        for b in (*self._pending, *self.all_bosses):
+            if b is boss or not is_automation_target(b.config):
+                continue
+            rem = b.remaining_time
+            if rem is None:
+                continue
+            if rem.total_seconds() <= CHAIN_GAP_SEC:
+                logger.info(
+                    "[자동화] 연탐 감지 — '%s' 추적 중 '%s' 가 %.0fs 뒤 스폰 (≤%.0fs)",
+                    boss.config.display_name, b.config.display_name,
+                    rem.total_seconds(), CHAIN_GAP_SEC)
+                return True
+        return False
 
     def _submit(self, boss: BossState):
         # 스폰 지나고 고우선순위 지역이면 스킵 (아무도 안 잡은 상태로 간주)
@@ -1058,7 +1155,10 @@ class BossAutomator(QObject):
             # 실제 보스 없으면 10초 후 stale clear 로 자동 IDLE.
             if presence_monitor is not None:
                 try:
-                    presence_monitor.start_tracking(boss, detect_now=True)
+                    # 연탐 판정은 도착 직후(=지금) 기준 — 대기열/남은 시간이 그 사이 바뀐다.
+                    presence_monitor.start_tracking(
+                        boss, detect_now=True,
+                        fast_confirm=self._is_chain_boss(boss))
                 except Exception as e:
                     logger.warning("[자동화] presence start_tracking 실패: %s", e)
 

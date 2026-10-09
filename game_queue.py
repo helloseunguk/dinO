@@ -26,6 +26,7 @@ class GameTaskQueue(QObject):
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
         self._queue: queue.Queue = queue.Queue()
+        self.current_task: str | None = None   # 실행 중인 태스크 이름 (GUI 상태 표시용)
         self._thread = threading.Thread(
             target=self._loop, daemon=True, name="GameTaskQueue")
         self._thread.start()
@@ -58,6 +59,7 @@ class GameTaskQueue(QObject):
             name, func = self._queue.get()
             logger.info("[큐] '%s' 실행 시작 (뒤에 %d개 대기)",
                         name, self._queue.qsize())
+            self.current_task = name
             self.task_started.emit(name)
             t0 = time.time()
             try:
@@ -69,4 +71,5 @@ class GameTaskQueue(QObject):
                 logger.exception("[큐] '%s' 실패", name)
                 self.task_failed.emit(name, str(e))
             finally:
+                self.current_task = None
                 self._queue.task_done()

@@ -14,6 +14,7 @@ GUI에서 수정하면 automation_targets.json 에 저장되며, 다음 실행 �
 
 import json
 import logging
+from datetime import datetime
 
 from models import BossConfig
 from paths import DATA_DIR
@@ -23,10 +24,11 @@ logger = logging.getLogger(__name__)
 
 # === 지역 우선순위 (위부터 높음) ===
 REGION_PRIORITY: list[str] = [
+    "바나",
+    "니플",
     "아스",
     "무스펠",
     "알브",
-    "니플",
     "니다벨",
     "요툰",
     # "미드",    # 비활성화
@@ -36,6 +38,8 @@ REGION_PRIORITY: list[str] = [
 # === 지역별 자동화 대상 보스 (리스트 순서 = 우선순위) ===
 # boss.config.name 기준으로 매칭 — boss_config.py 의 이름과 정확히 일치해야 함
 AUTOMATION_TARGETS: dict[str, list[str]] = {
+
+    "바나":   [],
     "니플":   [],
     "아스":   ["발리","노트","샤무크","스칼드메르"],
     "무스펠": ["수르트", "우로보로스","엘드룬","탕그리스니르","헤르가름","신마라","메기르"],
@@ -75,10 +79,70 @@ def priority_key(cfg: BossConfig) -> tuple[int, int]:
     return (region_idx, boss_idx)
 
 
+# === 우선순위 적용 토글 ===
+# ON  — 지역/보스 우선순위 순서로 실행 (priority_key)
+# OFF — 우선순위 무시, 그냥 스폰이 빠른 순서로 실행
+# 대상 목록(AUTOMATION_TARGETS) 자체는 토글과 무관하게 항상 적용된다.
+# 목록에 없는 보스는 OFF 여도 자동화하지 않는다.
+PRIORITY_ENABLED = True
+
+_FAR_FUTURE = datetime.max
+
+
+def is_priority_enabled() -> bool:
+    return PRIORITY_ENABLED
+
+
+def order_key(boss):
+    """자동화 실행 순서 키 (BossState 를 받는다).
+
+    ON  → (지역 인덱스, 보스 인덱스) — 우선순위 순
+    OFF → 다음 스폰 시각 — 빠른 순. 시각을 모르면 맨 뒤로 민다.
+    """
+    if PRIORITY_ENABLED:
+        return priority_key(boss.config)
+    return boss.next_spawn_at or _FAR_FUTURE
+
+
 # === 런타임 편집 지원 (GUI에서 수정) ===
 
 _TARGETS_JSON = DATA_DIR / "automation_targets.json"
 _PRESETS_JSON = DATA_DIR / "automation_presets.json"
+_SETTINGS_JSON = DATA_DIR / "automation_settings.json"
+
+
+def set_priority_enabled(enabled: bool) -> None:
+    """토글 변경 + 파일 저장 (다음 실행에도 유지)."""
+    global PRIORITY_ENABLED
+    PRIORITY_ENABLED = bool(enabled)
+    try:
+        _SETTINGS_JSON.write_text(
+            json.dumps({"priority_enabled": PRIORITY_ENABLED},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.warning("[자동화] 우선순위 설정 저장 실패: %s", e)
+    logger.info("[자동화] 보스 우선순위 %s — %s",
+                "적용" if PRIORITY_ENABLED else "미적용",
+                "우선순위 순으로 실행" if PRIORITY_ENABLED else "스폰 빠른 순으로 실행")
+
+
+def load_runtime_settings() -> bool:
+    """automation_settings.json 에서 우선순위 토글 로드. 없으면 기본값(ON) 유지."""
+    global PRIORITY_ENABLED
+    if not _SETTINGS_JSON.exists():
+        return False
+    try:
+        data = json.loads(_SETTINGS_JSON.read_text(encoding="utf-8"))
+        PRIORITY_ENABLED = bool(data.get("priority_enabled", True))
+        logger.info("[자동화] 우선순위 적용 = %s ← %s",
+                    PRIORITY_ENABLED, _SETTINGS_JSON.name)
+        return True
+    except Exception as e:
+        logger.warning("[자동화] 우선순위 설정 로드 실패 (%s): %s",
+                       _SETTINGS_JSON.name, e)
+        return False
 
 
 # === 스킬 프리셋 (보스별) ===

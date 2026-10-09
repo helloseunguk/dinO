@@ -13,10 +13,18 @@ def _is_admin() -> bool:
 
 def _elevate_and_exit():
     """현재 프로세스를 관리자 권한으로 재실행하고 원본은 종료."""
-    params = " ".join(f'"{a}"' for a in sys.argv)
+    import os
+
+    # 스크립트 경로는 절대경로로 넘긴다. runas 승격 시 작업 디렉터리가
+    # System32 로 바뀌므로 상대경로("main.py")면 스크립트를 못 찾고 조용히 종료됨.
+    args = list(sys.argv)
+    if args:
+        args[0] = os.path.abspath(args[0])
+    params = " ".join(f'"{a}"' for a in args)
+    workdir = os.path.dirname(os.path.abspath(sys.argv[0])) or None
     # SW_SHOWNORMAL = 1
     rc = ctypes.windll.shell32.ShellExecuteW(
-        None, "runas", sys.executable, params, None, 1
+        None, "runas", sys.executable, params, workdir, 1
     )
     # ShellExecuteW 반환값이 32 초과면 성공
     if rc <= 32:
@@ -34,24 +42,60 @@ if not _is_admin():
     _elevate_and_exit()
 
 
+def _set_dpi_awareness():
+    """PySide/Qt import 전에 프로세스 DPI 인식을 Qt 기본값(PER_MONITOR_V2)으로 고정.
+
+    cmd 의 `start` 로 실행하면 부모(cmd)에서 물려받은 DPI 컨텍스트 때문에
+    Qt 가 스스로 SetProcessDpiAwarenessContext(PER_MONITOR_V2) 를 호출하다
+    'Access denied' 로 실패하고, 그 결과 메인 창 좌표 계산이 깨져 창이
+    화면 밖(-25600 등)에 생성된다. Qt 가 원하는 값과 '동일하게' 미리 설정해
+    두면 Qt 는 재설정을 시도하지 않아 문제가 사라진다.
+    """
+    try:
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4  (Qt 기본값과 일치)
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        return
+    except Exception:
+        pass
+    try:
+        # PROCESS_PER_MONITOR_DPI_AWARE = 2 (구버전 Windows 폴백)
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+# PySide import 이전에 DPI 인식 고정 (창이 화면 밖에 생성되는 문제 방지)
+_set_dpi_awareness()
+
+
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 import boss_store
 import ocr_engine
-from automation_config import load_runtime_targets, load_runtime_presets
-from boss_config import BOSS_CONFIGS, CHECK_INTERVAL, SYNC_INTERVAL
+from automation_config import (
+    load_runtime_targets, load_runtime_presets, load_runtime_settings)
+from boss_config import BOSS_CONFIGS, CHECK_INTERVAL
 from paths import BUNDLED_DIR
 
 # 자동화 우선순위 / 스킬 프리셋 커스텀 저장 있으면 로드
 load_runtime_targets()
 load_runtime_presets()
+load_runtime_settings()   # 우선순위 적용 토글
 from models import BossState
 from notifier import CompositeNotifier, DiscordNotifier, GuiNotifier, LogNotifier, SystemNotifier
 from screen_sync import ScreenSync
+from api_sync import ApiSync
+from notice_watcher import NoticeWatcher
 from scheduler import BossScheduler
 from automator import BossAutomator
 from game_queue import GameTaskQueue
+from exp_tracker import ExpTracker
 from presence_monitor import PresenceMonitor
 from gui import MainWindow
 
@@ -149,6 +193,37 @@ def create_bosses() -> list[BossState]:
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1490302982905135215/1MNi0mZHpqXLf7dt_JbOuFIW5HwTNTXlh1Vy8rUmAkKF9Ldd30nkkRxkDm-6SLagkYjt"
 
 
+def _center_on_primary(window):
+    """주 화면 중앙으로 창을 (필요 시 크기까지) 정상 배치.
+
+    cmd `start` 로 실행 시 DPI 확정 타이밍 경합으로 창이 (-25600,-25600),
+    128x22 같은 깨진 지오메트리로 남는 경우가 있다. show() 직후엔 아직
+    확정 전이라 이벤트 루프가 한 바퀴 돈 뒤(QTimer.singleShot) 호출한다.
+    깨진 크기면 원래 크기로 복구하고, 항상 주 화면 안으로 이동시킨다.
+    """
+    try:
+        from PySide6.QtGui import QGuiApplication
+
+        screen = window.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+
+        w, h = window.width(), window.height()
+        # 지오메트리가 깨진(비정상적으로 작은) 경우 기본 크기로 복구
+        if w < 400 or h < 300:
+            w, h = 960, 720
+        # 화면보다 크면 화면에 맞춤
+        w = min(w, avail.width())
+        h = min(h, avail.height())
+
+        x = avail.x() + (avail.width() - w) // 2
+        y = avail.y() + (avail.height() - h) // 2
+        window.setGeometry(x, y, w, h)
+    except Exception:
+        logging.getLogger("main").warning("[GUI] 창 중앙 배치 실패", exc_info=True)
+
+
 def main():
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(str(BUNDLED_DIR / "images" / "boss.ico")))
@@ -192,7 +267,8 @@ def main():
     from alert_settings import load_alert_minutes, apply_to_bosses
     apply_to_bosses(bosses, load_alert_minutes())
 
-    screen_sync = ScreenSync()
+    screen_sync = ScreenSync()          # 수동 동기화 버튼 (OCR)
+    api_sync = ApiSync()                 # 자동 주기 동기화 (API)
     game_queue = GameTaskQueue()  # sync + automation 순차 처리
     presence_monitor = PresenceMonitor(game_queue=game_queue)
     automator = BossAutomator(screen_sync, game_queue,
@@ -202,14 +278,37 @@ def main():
         bosses, notifier,
         screen_sync=screen_sync,
         check_interval=CHECK_INTERVAL,
-        sync_interval=SYNC_INTERVAL,
         automator=automator,
         game_queue=game_queue,
         presence_monitor=presence_monitor,
+        api_sync=api_sync,
     )
 
-    window = MainWindow(bosses, scheduler, gui_notifier, discord_notifier)
+    # 운영 공지 감시 — 사이트 공지가 갱신되면 알림 발송 (게임 조작 없음)
+    notice_watcher = NoticeWatcher(api_sync.client)
+    notice_watcher.notice_posted.connect(
+        lambda preview: notifier.send(f"📢 **운영 공지** {preview}"))
+    notice_watcher.start()
+
+    # 경험치 추이 — IDLE 사냥 중 EXP % 를 읽어 100% 도달 시간 추정 (게임 조작 없음)
+    exp_tracker = ExpTracker(automator, game_queue)
+    exp_tracker.start()
+
+    window = MainWindow(bosses, scheduler, gui_notifier, discord_notifier,
+                        exp_tracker=exp_tracker)
     window.show()
+
+    def _place_window():
+        _center_on_primary(window)  # 화면 밖/깨진 지오메트리 보정
+        window.raise_()
+        window.activateWindow()
+
+    # show() 직후엔 DPI/지오메트리가 아직 확정 전이라 경합으로 창이 화면 밖에
+    # 남을 수 있다. 이벤트 루프가 돈 뒤 배치하고, 안전하게 한 번 더 보정한다.
+    from PySide6.QtCore import QTimer
+    _place_window()
+    QTimer.singleShot(0, _place_window)
+    QTimer.singleShot(400, _place_window)
     sys.exit(app.exec())
 
 

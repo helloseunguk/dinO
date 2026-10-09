@@ -1,0 +1,26 @@
+# Odin Boss Timer — runtime dependencies
+# Python 3.12 (Windows)
+
+# GUI
+PySide6
+
+# Screen capture / image processing
+mss
+numpy
+opencv-python
+Pillow
+
+# Windows built-in OCR (winsdk)
+winsdk
+
+# Text-to-speech notifications (optional imports in notifier.py)
+pyttsx3
+edge-tts
+
+# Build tool (build.bat / odin_timer.spec)
+pyinstaller
+
+# --- Optional / dev only ---
+# easyocr is used only by ocr_benchmark.py and is excluded from the
+# PyInstaller build. It pulls in torch (several GB). Uncomment to enable.
+# easyocr
