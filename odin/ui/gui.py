@@ -187,6 +187,8 @@ class StatusBanner(QFrame):
         elif automator.state == automator.STATE_RUNNING:
             boss = automator.current_boss
             text = f"🏃 보스 이동 중 — {boss.config.display_name if boss else '?'}"
+        elif automator.state == automator.STATE_CONTENT:
+            text = f"🏟 컨텐츠 진행 중 — {automator.current_content or '?'}"
         elif automator.state == automator.STATE_TRACKING:
             boss = automator.current_boss
             name = boss.config.display_name if boss else "?"
@@ -527,6 +529,17 @@ class OptionsDialog(QDialog):
             getattr(automator, "skip_short_remaining", True) if automator else True)
         self.chk_skip_short.toggled.connect(main_window._on_toggle_skip_short)
         layout.addRow("스킵 옵션:", self.chk_skip_short)
+
+        # 발할라 대전 자동 참가 — automator.valhalla_auto 직결
+        self.chk_valhalla = QCheckBox("등록 시간에 보스가 비면 발할라 대전 자동 참가")
+        self.chk_valhalla.setChecked(
+            getattr(automator, "valhalla_auto", True) if automator else True)
+        self.chk_valhalla.setToolTip(
+            "보스가 우선 — 다음 보스 출발까지 한 판(8분) 여유가 있을 때만 참가")
+        if automator is not None:
+            self.chk_valhalla.toggled.connect(
+                lambda on: setattr(automator, "valhalla_auto", on))
+        layout.addRow("발할라 대전:", self.chk_valhalla)
 
         # 스킬 프리셋 — 게임에서 키보드 A~E 로 바뀌는 프리셋
         from odin.automation import automation_config as ac
@@ -1336,6 +1349,12 @@ class MainWindow(QMainWindow):
         self.btn_sync.clicked.connect(self._on_sync_clicked)
         tb.addWidget(self.btn_sync)
 
+        # 발할라 대전 — 참가 등록 시간에 누르면 참가 → 자동 전투 → 필드 복귀까지
+        self.btn_valhalla = self._toolbar_button(
+            "🏟 발할라", "발할라 대전 참가 → 자동 전투 → 결과 닫고 필드 복귀 (Ctrl+Esc 로 중단)")
+        self.btn_valhalla.clicked.connect(self._on_valhalla_clicked)
+        tb.addWidget(self.btn_valhalla)
+
         # 화면 녹화 — 새 자동화를 만들 근거 자료 (게임 창 영상 + 클릭·키 기록)
         self.btn_record = self._toolbar_button(
             "⏺ 녹화", "게임 화면 녹화 + 클릭·키 입력 기록 (recordings 폴더)",
@@ -1648,6 +1667,15 @@ class MainWindow(QMainWindow):
     def _on_sync_clicked(self):
         logger.info("[클릭] 🔄 수동 동기화 버튼")
         self.scheduler.trigger_sync_now()
+
+    def _on_valhalla_clicked(self):
+        logger.info("[클릭] 🏟 발할라 버튼")
+        automator = getattr(self.scheduler, "automator", None)
+        if automator is None:
+            logger.warning("[발할라] automator 없음 — 실행 불가")
+            return
+        from odin.automation.valhalla import run_valhalla
+        automator.run_content("발할라 대전", run_valhalla)
 
     # DEBUG 토글로 활성화할 모듈들 (라이브러리 로그 제외)
     _DEBUG_LOGGERS = [

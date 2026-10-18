@@ -1118,6 +1118,13 @@ SWAP_CHECK_THRESHOLD_SEC = 240.0   # 4분
 # 경우가 흔하다 — 그럴 때 10초짜리 기본 창을 기다리면 다음 보스를 놓친다.
 CHAIN_GAP_SEC = 60.0
 
+# 발할라 대전 한 판에 드는 시간 — 다음 보스 출발(SOON)까지 이만큼 안 남았으면 참가하지
+# 않는다. 녹화(10-18): 매칭 95초 + 입장~결과 140초(목표 킬 조기 종료) + 복귀 15초.
+# 경기는 최대 5분이라 매칭 2분 + 카운트다운 + 5분 + 복귀로 잡는다.
+VALHALLA_RUN_EST_SEC = 8 * 60
+VALHALLA_CHECK_INTERVAL_SEC = 20.0   # 등록 여부 화면 확인 주기
+VALHALLA_RETRY_AFTER_SEC = 120.0     # 한 번 돌린 뒤 다시 확인하기까지
+
 
 class BossAutomator(QObject):
     """SOON 이벤트 시 자동화 시퀀스를 공용 큐에 적재.
@@ -1139,6 +1146,9 @@ class BossAutomator(QObject):
     STATE_IDLE = "IDLE"
     STATE_RUNNING = "RUNNING"
     STATE_TRACKING = "TRACKING"
+    # 발할라 대전 같은 컨텐츠 진행 중 — 그동안 SOON 보스는 _pending 에 보류된다.
+    # 끝나면 보류 해제 규칙(스폰 지남·촉박 스킵)이 그대로 적용된다.
+    STATE_CONTENT = "CONTENT"
 
     # 보스 이동 자동화 시작 시점 emit — GUI 방문 기록 탭 업데이트용. arg: 저장된 엔트리(dict).
     boss_visited = Signal(dict)
@@ -1161,7 +1171,12 @@ class BossAutomator(QObject):
         self._pending: list[BossState] = []
         self._state = self.STATE_IDLE
         self._current_boss: BossState | None = None
+        self._current_content: str | None = None
         self._idle_action_submitted = False  # 현재 IDLE 기간에 아이들 액션 이미 돌렸는지
+        # 발할라 대전 자동 참가 (check_valhalla). GUI 체크박스로 on/off.
+        self.valhalla_auto = True
+        self._valhalla_next_check = 0.0
+        self._valhalla_waiting_logged = False
 
         if presence_monitor is not None:
             presence_monitor.ended.connect(self._on_boss_ended)
@@ -1196,6 +1211,7 @@ class BossAutomator(QObject):
         self._pending.clear()
         self._state = self.STATE_IDLE
         self._current_boss = None
+        self._current_content = None
         self._idle_action_submitted = False
         if self.presence_monitor is not None:
             try:
@@ -1209,6 +1225,68 @@ class BossAutomator(QObject):
     def _on_esc_pressed(self):
         """Ctrl+Esc → 상태 강제 초기화."""
         self.reset()
+
+    @property
+    def current_content(self) -> str | None:
+        return self._current_content if self._state == self.STATE_CONTENT else None
+
+    def run_content(self, name: str, func) -> bool:
+        """컨텐츠 자동화(발할라 대전 등) 1회 적재. IDLE 일 때만 — 보스 진행 중엔 거절.
+        반환: 적재했으면 True."""
+        if self.game_queue is None:
+            logger.warning("[자동화] game_queue 없음 — '%s' 스킵", name)
+            return False
+        if self._state != self.STATE_IDLE:
+            logger.info("[자동화] '%s' 거절 — 상태 %s (IDLE 아님)", name, self._state)
+            return False
+        self._state = self.STATE_CONTENT
+        self._current_content = name
+        self._idle_action_submitted = False
+        self.game_queue.submit(f"content:{name}", func)
+        return True
+
+    def check_valhalla(self, next_soon_sec: float | None):
+        """발할라 대전 자동 참가 — 보스가 우선이다. 스케줄러가 tick마다 호출.
+
+        참가 조건: IDLE · 보류 보스 없음 · 다음 보스 출발(SOON)까지 한 판이 끝날 여유
+        · 화면에 참가 등록이 열려 있음(흰 카운트다운). 등록 시간은 일정표 대신 화면으로
+        판단한다 — 보스가 비는 순간이 등록 시간 안이기만 하면 그때 들어간다.
+        """
+        if not self.valhalla_auto or self.game_queue is None:
+            return
+        if self._state != self.STATE_IDLE or self._pending:
+            return
+        now = time.time()
+        if now < self._valhalla_next_check:
+            return
+        self._valhalla_next_check = now + VALHALLA_CHECK_INTERVAL_SEC
+
+        from odin.automation.valhalla import registration_open, run_valhalla
+        if not registration_open():
+            self._valhalla_waiting_logged = False
+            return
+        if next_soon_sec is not None and next_soon_sec < VALHALLA_RUN_EST_SEC:
+            if not self._valhalla_waiting_logged:
+                logger.info(
+                    "[발할라] 등록 열림 — 다음 보스 출발까지 %.1f분 < 한 판 %.0f분, 보스 먼저",
+                    next_soon_sec / 60, VALHALLA_RUN_EST_SEC / 60)
+                self._valhalla_waiting_logged = True
+            return
+        self._valhalla_waiting_logged = False
+        logger.info("[발할라] 등록 열림 · 다음 보스 출발까지 %s → 자동 참가",
+                    "없음" if next_soon_sec is None else f"{next_soon_sec / 60:.1f}분")
+        if self.run_content("발할라 대전", run_valhalla):
+            # 실패로 끝나도 바로 다시 들이밀지 않게
+            self._valhalla_next_check = now + VALHALLA_RETRY_AFTER_SEC
+
+    def _end_content(self, name: str, how: str):
+        if self._state != self.STATE_CONTENT:
+            return
+        logger.info("[자동화] 상태 CONTENT → IDLE ('%s' %s)", name, how)
+        self._state = self.STATE_IDLE
+        self._current_content = None
+        self._idle_action_submitted = False
+        self._process_next_pending()
 
     def run_for(self, boss: BossState):
         if not self.enabled:
@@ -1357,6 +1435,9 @@ class BossAutomator(QObject):
                 except Exception as e:
                     logger.warning("[카메라] 작업 적재 실패: %s", e)
             return
+        if name.startswith("content:"):
+            self._end_content(name[len("content:"):], f"완료 {duration:.0f}s")
+            return
         if not name.startswith("automation:"):
             return  # sync 등 다른 task 는 무관
         if self._state != self.STATE_RUNNING:
@@ -1382,6 +1463,9 @@ class BossAutomator(QObject):
         """자동화 task 실패(Esc/타임아웃 등) → 즉시 IDLE, 다음 보류 꺼내기."""
         if name == "idle_action":
             logger.info("[아이들] 시퀀스 실패: %s", error)
+            return
+        if name.startswith("content:"):
+            self._end_content(name[len("content:"):], f"실패: {error}")
             return
         if not name.startswith("automation:"):
             return

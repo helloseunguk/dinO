@@ -308,14 +308,16 @@ class BossScheduler(QObject):
         self.tick.emit()
 
     def _check_idle_action(self):
-        """자동화 유휴 시 다음 스폰까지 남은 시간 계산 후 automator에 전달."""
-        if self.automator is None or not self.idle_enabled:
+        """자동화 유휴 시 다음 스폰까지 남은 시간 계산 후 automator에 전달.
+        발할라 대전 자동 참가도 여기서 — 아이들(사냥터 이동)보다 먼저 본다."""
+        if self.automator is None:
             return
         # 자동화 마스터 OFF면 아이들도 OFF (자동화 OFF = 알림만 동작)
         if not self.automation_enabled:
             return
         now = datetime.now()
         min_sec = None
+        min_soon_sec = None   # 다음 보스 출발(SOON = 스폰 - alert_before)까지
         for boss in self.bosses:
             if not is_automation_target(boss.config):
                 continue
@@ -324,6 +326,16 @@ class BossScheduler(QObject):
             sec = (boss.next_spawn_at - now).total_seconds()
             if sec > 0 and (min_sec is None or sec < min_sec):
                 min_sec = sec
+            if sec > 0:
+                soon = sec - boss.config.alert_before.total_seconds()
+                if min_soon_sec is None or soon < min_soon_sec:
+                    min_soon_sec = soon
+        try:
+            self.automator.check_valhalla(min_soon_sec)
+        except Exception as e:
+            logger.warning("[발할라] check_valhalla 실패: %s", e)
+        if not self.idle_enabled:
+            return
         try:
             self.automator.check_idle_action(min_sec)
         except Exception as e:
