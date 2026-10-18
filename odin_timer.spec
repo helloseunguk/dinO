@@ -25,9 +25,8 @@ PROJECT_DIR = Path(SPECPATH)
 
 # ── 번들할 자산 ───────────────────────────────────────────────
 datas = [
-    (str(PROJECT_DIR / "images" / "boss_icon.png"), "images"),
-    (str(PROJECT_DIR / "images" / "boss.ico"), "images"),
-    (str(PROJECT_DIR / "images" / "auto.png"), "images"),
+    # 템플릿 이미지 전부 (camera2/camera_n/boss_move_* 등 — 하나씩 나열하면 새 이미지를 빠뜨린다)
+    (str(PROJECT_DIR / "images"), "images"),
     (str(PROJECT_DIR / "discord_secret.txt"), "."),
 ]
 

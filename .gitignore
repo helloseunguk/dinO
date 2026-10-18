@@ -27,6 +27,8 @@ api_config.json
 boss_debug/
 ocr_debug/
 icon_debug/
+arrival_debug/
+recordings/
 
 # IDE / OS
 .vscode/settings.json

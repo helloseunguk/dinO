@@ -86,7 +86,7 @@ from odin.core.paths import BUNDLED_DIR
 # 자동화 우선순위 / 스킬 프리셋 커스텀 저장 있으면 로드
 load_runtime_targets()
 load_runtime_presets()
-load_runtime_settings()   # 우선순위 적용 토글
+load_runtime_settings()   # 우선순위 적용 토글 · 보스/아이들 프리셋
 from odin.core.models import BossState
 from odin.notify.notifier import CompositeNotifier, DiscordNotifier, GuiNotifier, LogNotifier, SystemNotifier
 from odin.sync.screen_sync import ScreenSync

@@ -16,7 +16,6 @@ from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
-    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDateTimeEdit,
@@ -33,7 +32,6 @@ from PySide6.QtWidgets import (
     QMenu,
     QPlainTextEdit,
     QPushButton,
-    QRadioButton,
     QSizePolicy,
     QStatusBar,
     QTableWidget,
@@ -307,15 +305,16 @@ class PriorityDialog(QDialog):
     - OK 누르면 체크된 항목이 표시 순서대로 AUTOMATION_TARGETS 에 저장
     """
 
-    # 프리셋 정보는 item.data(UserRole) 에 저장. 표시명은 _format_item_text 로 렌더.
+    # 보스별 예외 프리셋은 item.data(UserRole) 에 저장 ("" = 옵션의 보스 기본 프리셋 따름).
+    # 표시명은 _format_item_text 로 렌더.
     _PRESET_ROLE = Qt.UserRole
     _NAME_ROLE = Qt.UserRole + 1
-    _PRESET_CHOICES = ("A", "C")
 
     def __init__(self, parent=None):
         super().__init__(parent)
         from odin.automation.automation_config import (
             REGION_PRIORITY, AUTOMATION_TARGETS, AUTOMATION_PRESETS,
+            PRESET_CHOICES, BOSS_PRESET, preset_label,
         )
         from odin.boss.boss_config import BOSS_CONFIGS
         self.setWindowTitle("자동화 대상 / 우선순위 편집")
@@ -324,7 +323,8 @@ class PriorityDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
             "☑ 체크된 보스만 자동화 대상. 드래그/▲▼ 로 순서 변경 (위쪽 = 높은 우선순위).\n"
-            "우측 프리셋(A/C): 도착 후 눌릴 키 — A=Delete, C=PageDown. OK 누르면 저장됨."
+            f"프리셋: 도착 후 누를 키. '기본' 이면 옵션의 보스 프리셋 {preset_label(BOSS_PRESET)} 을 따름. "
+            "OK 누르면 저장됨."
         ))
 
         self.tabs = QTabWidget()
@@ -345,7 +345,7 @@ class PriorityDialog(QDialog):
             lw = QListWidget()
             lw.setDragDropMode(QListWidget.InternalMove)
             for name in ordered:
-                preset = AUTOMATION_PRESETS.get(name, "A")
+                preset = AUTOMATION_PRESETS.get(name, "")
                 item = QListWidgetItem()
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
                 item.setCheckState(
@@ -382,20 +382,16 @@ class PriorityDialog(QDialog):
         self.tabs.currentChanged.connect(lambda _: self._on_selection_changed())
         layout.addWidget(self.tabs, stretch=1)
 
-        # 프리셋 선택 라디오 — 현재 선택된 항목의 프리셋을 바꿈
+        # 프리셋 선택 — 현재 선택된 보스의 예외 프리셋을 바꿈
         preset_row = QHBoxLayout()
         preset_row.addWidget(QLabel("선택된 보스 프리셋:"))
-        self._preset_group = QButtonGroup(self)
-        self._radio_a = QRadioButton("A (Delete)")
-        self._radio_c = QRadioButton("C (PageDown)")
-        self._preset_group.addButton(self._radio_a)
-        self._preset_group.addButton(self._radio_c)
-        self._radio_a.toggled.connect(
-            lambda checked: checked and self._apply_preset_to_current("A"))
-        self._radio_c.toggled.connect(
-            lambda checked: checked and self._apply_preset_to_current("C"))
-        preset_row.addWidget(self._radio_a)
-        preset_row.addWidget(self._radio_c)
+        self.cb_preset = QComboBox()
+        self.cb_preset.addItem(f"기본 (옵션: {preset_label(BOSS_PRESET)})", "")
+        for p in PRESET_CHOICES:
+            self.cb_preset.addItem(preset_label(p), p)
+        self.cb_preset.currentIndexChanged.connect(
+            lambda idx: self._apply_preset_to_current(self.cb_preset.itemData(idx)))
+        preset_row.addWidget(self.cb_preset)
         preset_row.addStretch(1)
         layout.addLayout(preset_row)
 
@@ -405,7 +401,7 @@ class PriorityDialog(QDialog):
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
-        self._on_selection_changed()  # 초기 라디오 동기화
+        self._on_selection_changed()  # 초기 콤보 동기화
 
     def _move(self, list_w: QListWidget, delta: int):
         row = list_w.currentRow()
@@ -432,19 +428,19 @@ class PriorityDialog(QDialog):
         }
 
     def result_presets(self) -> dict[str, str]:
-        """모든 보스의 프리셋 매핑 (체크 여부 무관)."""
+        """보스별 예외 프리셋 매핑 ('기본' 으로 둔 보스는 빠짐, 체크 여부 무관)."""
         result: dict[str, str] = {}
         for lw in self.list_widgets.values():
             for i in range(lw.count()):
                 item = lw.item(i)
-                name = item.data(self._NAME_ROLE)
-                preset = item.data(self._PRESET_ROLE) or "A"
-                result[name] = preset
+                preset = item.data(self._PRESET_ROLE)
+                if preset:
+                    result[item.data(self._NAME_ROLE)] = preset
         return result
 
     def _format_item_text(self, name: str, preset: str) -> str:
-        """리스트 아이템 표시 문자열 — 기본 프리셋 A 는 suffix 생략."""
-        return f"{name}  ({preset})" if preset != "A" else name
+        """리스트 아이템 표시 문자열 — 예외 프리셋이 있는 보스만 suffix."""
+        return f"{name}  ({preset})" if preset else name
 
     def _current_list(self) -> QListWidget | None:
         tab_idx = self.tabs.currentIndex()
@@ -455,20 +451,15 @@ class PriorityDialog(QDialog):
         return self.list_widgets.get(region)
 
     def _on_selection_changed(self, *_):
-        """현재 선택된 아이템의 프리셋으로 라디오 동기화."""
+        """현재 선택된 아이템의 프리셋으로 콤보 동기화."""
         lw = self._current_list()
         item = lw.currentItem() if lw is not None else None
-        preset = item.data(self._PRESET_ROLE) if item is not None else None
-        # 시그널 블록 — 라디오 변경이 역방향으로 아이템을 건드리지 않도록
-        self._radio_a.blockSignals(True)
-        self._radio_c.blockSignals(True)
-        enabled = item is not None
-        self._radio_a.setEnabled(enabled)
-        self._radio_c.setEnabled(enabled)
-        self._radio_a.setChecked(preset == "A")
-        self._radio_c.setChecked(preset == "C")
-        self._radio_a.blockSignals(False)
-        self._radio_c.blockSignals(False)
+        preset = (item.data(self._PRESET_ROLE) or "") if item is not None else ""
+        # 시그널 블록 — 콤보 변경이 역방향으로 아이템을 건드리지 않도록
+        self.cb_preset.blockSignals(True)
+        self.cb_preset.setEnabled(item is not None)
+        self.cb_preset.setCurrentIndex(max(0, self.cb_preset.findData(preset)))
+        self.cb_preset.blockSignals(False)
 
     def _apply_preset_to_current(self, preset: str):
         """현재 선택된 아이템의 프리셋 변경 + 표시 갱신."""
@@ -536,6 +527,26 @@ class OptionsDialog(QDialog):
             getattr(automator, "skip_short_remaining", True) if automator else True)
         self.chk_skip_short.toggled.connect(main_window._on_toggle_skip_short)
         layout.addRow("스킵 옵션:", self.chk_skip_short)
+
+        # 스킬 프리셋 — 게임에서 키보드 A~E 로 바뀌는 프리셋
+        from odin.automation import automation_config as ac
+        self.cb_boss_preset = QComboBox()
+        self.cb_idle_preset = QComboBox()
+        for p in ac.PRESET_CHOICES:
+            self.cb_boss_preset.addItem(ac.preset_label(p), p)
+            self.cb_idle_preset.addItem(ac.preset_label(p), p)
+        self.cb_boss_preset.setCurrentIndex(self.cb_boss_preset.findData(ac.BOSS_PRESET))
+        self.cb_idle_preset.setCurrentIndex(self.cb_idle_preset.findData(ac.IDLE_PRESET))
+        self.cb_boss_preset.currentIndexChanged.connect(
+            lambda i: ac.set_boss_preset(self.cb_boss_preset.itemData(i)))
+        self.cb_idle_preset.currentIndexChanged.connect(
+            lambda i: ac.set_idle_preset(self.cb_idle_preset.itemData(i)))
+        self.cb_boss_preset.setToolTip(
+            "보스 앞에 도착해 G+F 다음에 누를 프리셋 키.\n"
+            "보스마다 다르게 하려면 '우선순위 편집…' 에서 지정")
+        self.cb_idle_preset.setToolTip("보스가 끝나 사냥(아이들)으로 돌아갈 때 누를 프리셋 키")
+        layout.addRow("보스 프리셋:", self.cb_boss_preset)
+        layout.addRow("아이들 프리셋:", self.cb_idle_preset)
 
         # 우선순위 편집 — 별도 다이얼로그 호출
         self.btn_priority = QPushButton("우선순위 편집…")
@@ -1209,6 +1220,8 @@ class MainWindow(QMainWindow):
         self.gui_notifier = gui_notifier
         self.discord_notifier = discord_notifier
         self._discord_enabled = discord_notifier is not None
+        from odin.record.screen_recorder import ScreenRecorder
+        self.recorder = ScreenRecorder()
 
         self._build_toolbar()
         self._build_central()
@@ -1322,6 +1335,13 @@ class MainWindow(QMainWindow):
         self.btn_sync = self._toolbar_button("🔄 동기화", "지금 화면 캡처(OCR)로 시간표 동기화")
         self.btn_sync.clicked.connect(self._on_sync_clicked)
         tb.addWidget(self.btn_sync)
+
+        # 화면 녹화 — 새 자동화를 만들 근거 자료 (게임 창 영상 + 클릭·키 기록)
+        self.btn_record = self._toolbar_button(
+            "⏺ 녹화", "게임 화면 녹화 + 클릭·키 입력 기록 (recordings 폴더)",
+            checkable=True, labels=("⏺ 녹화", "⏹ 녹화 중 00:00:00"))
+        self.btn_record.toggled.connect(self._on_record_toggled)
+        tb.addWidget(self.btn_record)
 
         # 오른쪽 그룹(옵션·도구)을 끝으로 밀어내는 빈 공간
         spacer = QWidget(tb)
@@ -1570,6 +1590,28 @@ class MainWindow(QMainWindow):
             self.next_banner.refresh()
         if hasattr(self, "status_banner"):
             self.status_banner.refresh(self.btn_run.isChecked())
+        if self.btn_record.isChecked():
+            if self.recorder.recording:
+                s = int(self.recorder.elapsed())
+                self.btn_record.setText(f"⏹ 녹화 중 {s // 3600:02d}:{s // 60 % 60:02d}:{s % 60:02d}")
+            else:
+                # 2시간 상한 등으로 녹화가 스스로 끝난 경우 버튼도 되돌린다
+                self.btn_record.setChecked(False)
+
+    def _on_record_toggled(self, on: bool):
+        if on:
+            if not self.recorder.start():
+                self.btn_record.blockSignals(True)
+                self.btn_record.setChecked(False)
+                self.btn_record.blockSignals(False)
+                self.status.showMessage("[녹화] 게임 창을 찾지 못해 시작하지 않음", 8000)
+                return
+            self.btn_record.setText("⏹ 녹화 중 00:00:00")
+            self.status.showMessage(f"[녹화] 시작 → {self.recorder.folder}")
+        else:
+            self.recorder.stop()
+            self.btn_record.setText("⏺ 녹화")
+            self.status.showMessage(f"[녹화] 저장됨 → {self.recorder.folder}", 15000)
 
     def _on_run_toggled(self, running: bool):
         logger.info("[클릭] 실행 토글: %s", "ON" if running else "OFF")
@@ -1635,10 +1677,9 @@ class MainWindow(QMainWindow):
         presets = dlg.result_presets()
         update_presets(presets)
         save_runtime_presets()
-        n_nondefault = sum(1 for v in presets.values() if v != "A")
         logger.info(
-            "[GUI] 자동화 우선순위 저장 완료 (%d개 지역, 비기본 프리셋 %d개)",
-            len(targets), n_nondefault)
+            "[GUI] 자동화 우선순위 저장 완료 (%d개 지역, 보스별 예외 프리셋 %d개)",
+            len(targets), len(presets))
 
     def _on_idle_item_changed(self, name: str):
         from odin.automation.automator import set_idle_item

@@ -25,8 +25,8 @@ from PIL import Image
 from PySide6.QtCore import QObject, Signal, Slot
 
 from odin.automation.automation_config import (
-    REGION_PRIORITY, is_automation_target, is_priority_enabled, order_key,
-    priority_key)
+    PRESET_KEYS, REGION_PRIORITY, is_automation_target, is_priority_enabled,
+    order_key, priority_key)
 from odin.boss.boss_config import TAB_BOSS_MAP, TAB_TIME_COORDS
 from odin.game.game_coords import (
     find_game_window, scale_xy,
@@ -82,9 +82,14 @@ MOVE_IMAGE_TIMEOUT = 10.0      # 이미지 나타날 때까지 최대 대기 (�
 MOVE_IMAGE_POLL_INTERVAL = 0.3
 
 # 'm' 감시 영역 — 중심 좌표 + 크롭 크기 (TAB_COORDS와 동일한 방식)
-OCR_CENTER = (966, 600)    # 게임 내부 좌표 (BASE 1920×1009)
+# 캐릭터 밑 남은 거리('515m') 영역. 탈것을 타면 글자가 더 아래(y≈610~620)에 떠서
+# 예전 영역(y 575~625)에서는 절반이 잘렸다 — 수르트 이동 201프레임 중 2장만 읽힘.
+# 15px 내리고 10px 늘리니 13장 (2026-10-17 실측). 예전 위치(y 600)도 여전히 포함.
+OCR_CENTER = (966, 615)    # 게임 내부 좌표 (BASE 1920×1009)
 OCR_CROP_W = 150
-OCR_CROP_H = 50
+OCR_CROP_H = 60
+# Windows OCR 은 작은 글씨를 원본 크기로는 거의 못 읽는다 — 2배 확대 (3배는 '7489' 같은 오인식)
+OCR_UPSCALE = 2
 
 # 각 액션 사이 딜레이
 STEP_DELAY = 0.5
@@ -189,6 +194,24 @@ ARRIVAL_HOLD_BEFORE_SPAWN_SEC: dict[str, float] = {
 # 홀드 상한 — 스폰 시각이 잘못 잡혔을 때 큐가 무한정 막히는 것 방지
 ARRIVAL_HOLD_MAX_SEC = 180.0
 
+# === 비행 구간이 있는 보스 (도착 판정 예외) ===
+# 수르트는 탈것으로 달리다가 번지대부터는 날아서 간다. 날 때는 거리(m) 글자가 없고,
+# 첫 거리 표시부터 착지까지 약 80초 걸린다 (2026-10-17 실측). 기본 규칙으로는
+# 출발 전 탈것 소환하며 서 있는 동안 미니맵이 멈춰 11초 만에 '도착' 처리됐다 (09-26).
+#   - 미니맵 정지 판정은 이동 시작(boss_move_5 클릭) 후 FLYING_ROUTE_MIN_TRAVEL_SEC 가
+#     지난 뒤에만. 비행 중에도 미니맵 변화가 0~0.8% 로 '정지' 로 보여 (기준 5%,
+#     10-17 04:39 실측) 미니맵만으로는 착지를 알 수 없다 — 사실상 이동 시간으로 판정.
+#     이동 시작 → 착지 93초(10-17 수동 이동), 91초(10-17 04:39 자동화) 실측 + 여유
+#   - 'm 이 15초 안 보이면 Phase 2' 폴백은 쓰지 않는다 — 나는 동안 m 이 없는 게 정상
+#   - 전체 대기 상한을 늘린다
+#   - 판정 근거를 남기려고 m 영역·미니맵 캡처를 FLYING_DEBUG_DIR 에 저장 (최근 N회분)
+FLYING_ROUTE_BOSSES = {"수르트"}
+FLYING_ROUTE_MAX_WAIT_SEC = 180
+FLYING_ROUTE_MIN_TRAVEL_SEC = 100.0
+FLYING_DEBUG_DIR = DATA_DIR / "arrival_debug"
+FLYING_DEBUG_EVERY_SEC = 2.0
+FLYING_DEBUG_KEEP_RUNS = 3
+
 # === 미니맵 정지 감지 (도착 빠른 판정 보조) ===
 # 미니맵을 매 폴링마다 캡처해 직전 프레임과 cv2.absdiff → 이진화 → 변경 픽셀 비율로
 # '정지'를 판정. m_seen_once 인 상태에서 미니맵이 N회 연속 정지 + (m 사라짐 또는 ≤10m)
@@ -219,8 +242,6 @@ OCR_DEBUG_KEEP_LATEST = 500            # 시퀀스 시작 시 가장 오래된 �
 _VK_F = 0x46
 _VK_G = 0x47
 _VK_C = 0x43
-_VK_DELETE = 0x2E
-_VK_NEXT = 0x22          # PageDown
 # G → F 사이 딜레이
 KEY_GF_DELAY = 0.3
 
@@ -231,17 +252,26 @@ CAMERA_CHECK_IMAGE = "camera2.png"
 CAMERA_CHECK_CENTER = (30, 441)
 CAMERA_CHECK_W = 50
 CAMERA_CHECK_H = 50
-CAMERA_CHECK_THRESHOLD = 0.9
+CAMERA_CHECK_THRESHOLD = 0.7
+# 로딩 완료 감지는 아이콘이 보이기만 하면 된다 (모드 무관). 반투명이라 아이콘이 있어도
+# 0.54~0.74 로 흔들려 0.7 이면 자주 놓친다. 아이콘 없는 왼쪽 열은 0.22 이하 (2026-10-17 실측)
+LOADING_ICON_THRESHOLD = 0.5
+# 카메라 보정은 아이콘 안 글자만 따로 보고, Q 글자와 N 글자 중 어느 쪽을 더 닮았는지로
+# 판단한다. 아이콘이 반투명이라 점수 자체가 배경(풀밭/모래)에 따라 크게 흔들려
+# 고정 임계값으로는 구분이 안 됐다 — 통째로: Q 0.695 / N 0.659,
+# 글자만: Q 0.55~0.77 / N 0.57. 같은 배경이면 Q 프레임은 늘 Q 쪽이 0.10 이상 높았다
+# (2026-10-17 실측, Q 8프레임).
+CAMERA_N_IMAGE = "camera_n.png"      # N 모드 아이콘 (camera2.png 와 같은 크기)
+CAMERA_LETTER_BOX = (8, 6, 23, 23)   # 아이콘 안 글자 영역 (x0, y0, x1, y1)
+CAMERA_LETTER_MARGIN = 0.05          # Q 닮음 - N 닮음 이 이 이상이어야 Q
+CAMERA_LETTER_MIN = 0.45             # 아이콘이 아예 안 보일 때(로딩 등) 오판 방지
 CAMERA_CHECK_INTERVAL = 1.0
 CAMERA_CHECK_MAX_ITERS = 30
 
-# 보스별 스킬 프리셋 → Virtual-Key 매핑.
-# 도착 시 G+F 다음에 해당 키를 눌러 게임 내 스킬셋을 전환.
-# IDLE 복귀 시에는 'A' 키를 눌러 기본 프리셋으로 되돌림.
-SKILL_PRESET_KEYS = {
-    "A": _VK_DELETE,     # Delete
-    "C": _VK_NEXT,       # PageDown
-}
+# 스킬 프리셋 → Virtual-Key (키 정의는 automation_config.PRESET_KEYS).
+# 보스 도착 시 G+F 다음에 보스 프리셋, IDLE 복귀 시 아이들 프리셋을 누른다
+# (어느 프리셋인지는 옵션 — automation_config.BOSS_PRESET / IDLE_PRESET).
+SKILL_PRESET_KEYS = {p: vk for p, (vk, _name) in PRESET_KEYS.items()}
 
 
 def _press_key(vk_code: int):
@@ -389,6 +419,7 @@ def _run_sequence(boss: BossState, screen_sync):
                 BOSS_MOVE_5_CENTER, BOSS_MOVE_5_W, BOSS_MOVE_5_H,
                 bx, by, cw, ch):
             raise TimeoutError(f"'{BOSS_MOVE_5_IMAGE}' 미감지 — 시퀀스 중단")
+        travel_started = time.time()   # 이동 시작 — 비행 구간 보스의 이동 시간 기준
         _sleep_cancellable(STEP_DELAY)
 
         # 6) 게임 로딩 완료 감지 — camera2.png 가 노출될 때까지 대기 후 도착 판정 시작
@@ -398,9 +429,12 @@ def _run_sequence(boss: BossState, screen_sync):
 
         abs_region = _center_to_abs_region(
             OCR_CENTER, OCR_CROP_W, OCR_CROP_H, bx, by, cw, ch)
-        logger.info("[자동화] 도착 대기 시작 (최대 %d초) region=%s",
-                    MAX_WAIT_SECONDS, abs_region)
-        _wait_until_arrival(abs_region, bx, by, cw, ch)
+        flying = boss.config.name in FLYING_ROUTE_BOSSES
+        logger.info("[자동화] 도착 대기 시작 (최대 %d초%s) region=%s",
+                    FLYING_ROUTE_MAX_WAIT_SEC if flying else MAX_WAIT_SECONDS,
+                    ", 비행 구간 보스" if flying else "", abs_region)
+        _wait_until_arrival(abs_region, bx, by, cw, ch, flying_route=flying,
+                            travel_started=travel_started)
 
         # 도착 직후 settle — 게임이 G/F 입력을 안정적으로 받도록 짧은 대기
         _sleep_cancellable(0.5)
@@ -416,7 +450,7 @@ def _run_sequence(boss: BossState, screen_sync):
         _press_key(_VK_F)
         logger.info("[자동화] G + F 키 입력 완료")
 
-        # 9) 스킬 프리셋 키 — 보스별 설정 (기본 A=Delete, C=PageDown)
+        # 9) 스킬 프리셋 키 — 보스별 예외가 없으면 옵션의 보스 기본 프리셋
         from odin.automation.automation_config import get_preset
         preset = get_preset(boss.config.name)
         preset_vk = SKILL_PRESET_KEYS.get(preset)
@@ -499,6 +533,41 @@ def _capture_minimap_gray(sct, bx: int, by: int, cw: int, ch: int) -> np.ndarray
     return np.dot(img_rgb[..., :3], [0.299, 0.587, 0.114]).astype(np.uint8)
 
 
+def _flying_debug_prepare():
+    """비행 구간 도착 판정 캡처 폴더 — 이번 회차용 새 폴더, 최근 FLYING_DEBUG_KEEP_RUNS 회분만 유지."""
+    try:
+        FLYING_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        runs = sorted(p for p in FLYING_DEBUG_DIR.iterdir() if p.is_dir())
+        for old in runs[:max(0, len(runs) - FLYING_DEBUG_KEEP_RUNS + 1)]:
+            for f in old.iterdir():
+                f.unlink(missing_ok=True)
+            old.rmdir()
+        run = FLYING_DEBUG_DIR / datetime.now().strftime("%m%d_%H%M%S")
+        run.mkdir()
+        return run
+    except Exception as e:
+        logger.warning("[도착디버그] 폴더 준비 실패: %s", e)
+        return None
+
+
+def _flying_debug_save(run_dir, elapsed: float, m_gray: np.ndarray,
+                       minimap_gray: np.ndarray | None, text: str):
+    """m 영역 + 미니맵을 한 장으로 저장. 파일명에 경과 시간·OCR 결과."""
+    try:
+        tile = m_gray
+        if minimap_gray is not None:
+            h = max(m_gray.shape[0], minimap_gray.shape[0])
+            pad = lambda a: cv2.copyMakeBorder(a, 0, h - a.shape[0], 0, 4,
+                                               cv2.BORDER_CONSTANT, value=255)
+            tile = np.hstack([pad(m_gray), pad(minimap_gray)])
+        safe = re.sub(r"[^0-9a-zA-Z가-힣]", "_", text or "")[:20]
+        ok, buf = cv2.imencode(".png", tile)   # 한글 경로 대비 imwrite 대신
+        if ok:
+            (run_dir / f"{elapsed:05.1f}s_{safe}.png").write_bytes(buf.tobytes())
+    except Exception as e:
+        logger.debug("[도착디버그] 저장 실패: %s", e)
+
+
 def _is_minimap_static(prev: np.ndarray, curr: np.ndarray) -> tuple[bool, float]:
     """이전/현재 미니맵 그레이스케일 비교.
     반환: (정지 여부, 변경 픽셀 비율 %).
@@ -527,9 +596,13 @@ def _secondary_confirm(sct, abs_region: dict) -> bool:
 
 
 def _wait_until_arrival(abs_region: dict,
-                        bx: int, by: int, cw: int, ch: int):
+                        bx: int, by: int, cw: int, ch: int,
+                        flying_route: bool = False,
+                        travel_started: float | None = None):
     """
     2단계 + 2차 확인 폴링으로 도착을 확정.
+    flying_route=True (수르트 등): FLYING_ROUTE_* 주석의 예외 규칙 적용.
+    travel_started: 이동 시작 시각(time.time) — 없으면 이 함수 시작 시각.
 
     Phase 1: 'm' 출현 → 사라짐 대기
              - m 아직 안 보임: 1초마다 휠다운 줌아웃
@@ -540,6 +613,10 @@ def _wait_until_arrival(abs_region: dict,
              2차 확인 중 m 재등장 시 Phase 2 재시작, 통과 시 도착 확정.
     """
     start = time.time()
+    travel_started = travel_started or start
+    max_wait = FLYING_ROUTE_MAX_WAIT_SEC if flying_route else MAX_WAIT_SECONDS
+    debug_dir = _flying_debug_prepare() if flying_route else None
+    last_debug_save = 0.0
     phase = 1
     m_seen_once = False
     last_m_value: int | None = None      # 마지막으로 관측된 거리값 (m)
@@ -555,15 +632,15 @@ def _wait_until_arrival(abs_region: dict,
         while True:
             _check_cancel()
             elapsed = time.time() - start
-            if elapsed > MAX_WAIT_SECONDS:
+            if elapsed > max_wait:
                 # Phase 1 에서 m 을 한 번도 못 본 경우 = 근거리 도착으로 간주
                 if phase == 1 and not m_seen_once:
                     logger.info(
                         "[자동화] m 미감지 상태로 %ds 경과 → 근거리 도착으로 간주",
-                        MAX_WAIT_SECONDS)
+                        max_wait)
                     return
                 raise TimeoutError(
-                    f"도착 대기 {MAX_WAIT_SECONDS}초 초과 (phase={phase})"
+                    f"도착 대기 {max_wait}초 초과 (phase={phase})"
                 )
             img_gray = _capture_gray(sct, abs_region)
             text = _read_m_region(img_gray)
@@ -592,16 +669,23 @@ def _wait_until_arrival(abs_region: dict,
                         minimap_static_streak += 1
                     else:
                         minimap_static_streak = 0
-                    logger.debug(
-                        "[미니맵] change=%.2f%% static_streak=%d/%d "
+                    # 비행 구간 보스는 나는 동안에도 미니맵이 바뀌는지 확인하려고 5초마다 남긴다
+                    log = logger.info if flying_route and int(elapsed * 2) % 10 == 0 else logger.debug
+                    log("[미니맵] (%.0fs, 이동 %.0fs) change=%.2f%% static_streak=%d/%d "
                         "m_absent_streak=%d/%d",
-                        change_pct, minimap_static_streak,
-                        MINIMAP_STATIC_STREAK_THRESHOLD,
+                        elapsed, time.time() - travel_started, change_pct,
+                        minimap_static_streak, MINIMAP_STATIC_STREAK_THRESHOLD,
                         m_absent_streak, M_ABSENT_STREAK_FOR_FAST_PATH)
                     m_gone_confirmed = m_absent_streak >= M_ABSENT_STREAK_FOR_FAST_PATH
                     m_near = m_val is not None and m_val <= NEAR_ARRIVAL_DIST
-                    # 미니맵 정지 + (m 연속 미검출 OR m 근거리) → m_seen_once 무관하게 즉시 도착
-                    if (minimap_static_streak >= MINIMAP_STATIC_STREAK_THRESHOLD
+                    # 비행 구간 보스는 착지할 만큼 이동 시간이 지난 뒤에만 —
+                    # 비행 중에도 미니맵이 '정지' 로 보이기 때문
+                    travel = time.time() - travel_started
+                    landed_by_time = (not flying_route
+                                      or travel >= FLYING_ROUTE_MIN_TRAVEL_SEC)
+                    # 미니맵 정지 + (m 연속 미검출 OR m 근거리) → 즉시 도착
+                    if (landed_by_time
+                            and minimap_static_streak >= MINIMAP_STATIC_STREAK_THRESHOLD
                             and (m_gone_confirmed or m_near)):
                         logger.info(
                             "[자동화] 도착 빠른 판정 — 미니맵 %d회 정지 + m %s",
@@ -611,6 +695,9 @@ def _wait_until_arrival(abs_region: dict,
                         return
                 if curr_minimap is not None:
                     prev_minimap = curr_minimap
+                if debug_dir is not None and time.time() - last_debug_save >= FLYING_DEBUG_EVERY_SEC:
+                    last_debug_save = time.time()
+                    _flying_debug_save(debug_dir, elapsed, img_gray, curr_minimap, text)
 
             if phase == 1:
                 logger.debug("[폴링 P1] (%.1fs) OCR='%s' | m값=%s | last=%s | m본적=%s",
@@ -636,7 +723,9 @@ def _wait_until_arrival(abs_region: dict,
                     # m 을 이전에 봤는데 지금은 없음 — 두 경로 중 하나 통과 시 Phase 2
                     absence = (time.time() - last_m_seen_at) if last_m_seen_at else 0.0
                     near = last_m_value is not None and last_m_value <= NEAR_ARRIVAL_DIST
-                    timeout_fallback = absence >= M_ABSENCE_FORCE_PHASE2_SEC
+                    # 비행 구간 보스는 나는 동안 m 이 없는 게 정상 — 폴백 안 씀 (미니맵 정지로만)
+                    timeout_fallback = (not flying_route
+                                        and absence >= M_ABSENCE_FORCE_PHASE2_SEC)
                     if near:
                         logger.info(
                             "[자동화] 'm' 사라짐 (마지막 거리 %dm ≤ %dm) → Phase 2",
@@ -699,8 +788,10 @@ def _hold_until_pre_spawn(boss: BossState):
 
 
 def _read_m_region(img_gray: np.ndarray) -> str:
-    """OCR 전체 텍스트 반환 (Windows OCR 기반)."""
-    return ocr_text(img_gray)
+    """OCR 전체 텍스트 반환 (Windows OCR 기반, OCR_UPSCALE 배 확대 후)."""
+    big = cv2.resize(img_gray, None, fx=OCR_UPSCALE, fy=OCR_UPSCALE,
+                     interpolation=cv2.INTER_CUBIC)
+    return ocr_text(big)
 
 
 # === 스폰 지난 자동화 스킵 규칙 ===
@@ -724,11 +815,14 @@ def _is_stale_high_priority(boss: BossState) -> bool:
 IDLE_ACTION_THRESHOLD_SEC = 300.0   # 5분
 IDLE_CLICK_1 = (32, 164)            # 게임 내부 BASE 좌표 (인벤토리/메뉴 공통 클릭)
 
-# G 키 누르기 전 auto 아이콘 템플릿 매칭으로 준비 상태 확인
-AUTO_IMAGE_CENTER = (1853, 845)     # BASE 좌표
-AUTO_IMAGE_W = 70                   # 탐색 박스 폭
-AUTO_IMAGE_H = 70                   # 탐색 박스 높이
-AUTO_IMAGE_THRESHOLD = 0.7
+# 아이템 사용 후 AUTO 가 꺼진 버튼이 뜨면 그 버튼을 눌러 자동 사냥을 켠다.
+# auto.png = 오른쪽 아래 AUTO 버튼, 꺼진 상태 (57×55, 2026-10-17 교체).
+# 켜진 상태(둥근 화살표가 빛남)는 0.42 로 임계값 아래라 이미 켜져 있으면 안 누른다.
+AUTO_IMAGE_CENTER = (1855, 841)     # BASE 좌표 — 감지 영역 중심 (AUTO 버튼)
+AUTO_IMAGE_W = 80                   # 탐색 박스 폭 (템플릿 57 + 좌우 여유)
+AUTO_IMAGE_H = 80                   # 탐색 박스 높이 (템플릿 55 + 위아래 여유)
+AUTO_IMAGE_THRESHOLD = 0.6
+AUTO_CLICK_POS = AUTO_IMAGE_CENTER  # 감지한 AUTO 버튼을 그대로 클릭
 AUTO_IMAGE_MAX_WAIT_SEC = 30.0      # 최대 대기
 AUTO_IMAGE_POLL_INTERVAL = 0.5
 _AUTO_TEMPLATE_PATH = BUNDLED_DIR / "images" / "auto.png"
@@ -849,8 +943,8 @@ def _run_idle_sequence(screen_sync=None):
     auto_detected = _wait_for_auto_image(bx, by, cw, ch)
     if auto_detected:
         _sleep_cancellable(1.5)              # UI 트랜지션 안정화
-        _click_game_base(AUTO_IMAGE_CENTER, bx, by, cw, ch)
-        logger.info("[아이들] AUTO 위치 클릭 완료 (BASE %s)", AUTO_IMAGE_CENTER)
+        _click_game_base(AUTO_CLICK_POS, bx, by, cw, ch)
+        logger.info("[아이들] AUTO 위치 클릭 완료 (BASE %s)", AUTO_CLICK_POS)
     else:
         logger.warning("[아이들] auto 미감지 → 시퀀스 종료")
     logger.info("[아이들] 시퀀스 완료")
@@ -874,7 +968,7 @@ def _wait_for_loading_complete(bx: int, by: int, cw: int, ch: int) -> bool:
                 CAMERA_CHECK_IMAGE,
                 CAMERA_CHECK_CENTER, CAMERA_CHECK_W, CAMERA_CHECK_H,
                 bx, by, cw, ch,
-                CAMERA_CHECK_THRESHOLD)
+                LOADING_ICON_THRESHOLD)
         except Exception as e:
             logger.debug("[로딩감지] 매칭 실패: %s", e)
             _sleep_cancellable(LOADING_DETECT_INTERVAL)
@@ -892,13 +986,54 @@ def _wait_for_loading_complete(bx: int, by: int, cw: int, ch: int) -> bool:
     return False
 
 
+_CAMERA_LETTER_PAD = 2   # 아이콘 위치 오차 흡수 (px)
+
+
+def _camera_letter_scores(crop_gray: np.ndarray) -> tuple[float, float]:
+    """아이콘 crop(사방 _CAMERA_LETTER_PAD 여유 포함, 흑백) 의 글자가
+    Q(camera2.png) / N(camera_n.png) 글자를 각각 얼마나 닮았는지."""
+    x0, y0, x1, y1 = CAMERA_LETTER_BOX
+    pad = _CAMERA_LETTER_PAD
+    window = crop_gray[y0:y1 + pad * 2, x0:x1 + pad * 2]
+    scores = []
+    for name in (CAMERA_CHECK_IMAGE, CAMERA_N_IMAGE):
+        ref = cv2.cvtColor(_load_image_template(name), cv2.COLOR_BGR2GRAY)
+        scores.append(float(cv2.matchTemplate(
+            window, ref[y0:y1, x0:x1], cv2.TM_CCOEFF_NORMED).max()))
+    return scores[0], scores[1]
+
+
+def _camera_letter_score(bx: int, by: int, cw: int, ch: int
+                         ) -> tuple[float, float, float]:
+    """카메라 아이콘을 찾아 그 안 글자의 Q/N 닮음 점수.
+    반환: (Q 닮음, N 닮음, 아이콘 전체 점수)
+    """
+    template = _load_image_template(CAMERA_CHECK_IMAGE)
+    _, icon_score, (ax, ay) = _match_region(
+        CAMERA_CHECK_IMAGE, CAMERA_CHECK_CENTER, CAMERA_CHECK_W, CAMERA_CHECK_H,
+        bx, by, cw, ch, CAMERA_CHECK_THRESHOLD)
+    th, tw = template.shape[:2]
+    pad = _CAMERA_LETTER_PAD
+    with mss.mss() as sct:
+        shot = sct.grab({"left": ax - tw // 2 - pad, "top": ay - th // 2 - pad,
+                         "width": tw + pad * 2, "height": th + pad * 2})
+    crop = cv2.cvtColor(np.array(Image.frombytes(
+        "RGB", (shot.width, shot.height), shot.rgb)), cv2.COLOR_RGB2GRAY)
+    q, n = _camera_letter_scores(crop)
+    return q, n, icon_score
+
+
+def _camera_is_q(q: float, n: float) -> bool:
+    return q >= CAMERA_LETTER_MIN and q - n >= CAMERA_LETTER_MARGIN
+
+
 def _run_camera_check(screen_sync=None):
     """IDLE 진입 시 카메라 뷰 보정.
-    camera2.png 매칭 점수 >= CAMERA_CHECK_THRESHOLD 될 때까지
+    카메라 아이콘 안 글자가 N 보다 Q 를 뚜렷이 닮을 때까지
     CAMERA_CHECK_INTERVAL 간격으로 C 키 반복. 최대 CAMERA_CHECK_MAX_ITERS 회.
     """
     _cancel_event.clear()
-    logger.info("[카메라] 뷰 보정 시작 (임계값 %.2f)", CAMERA_CHECK_THRESHOLD)
+    logger.info("[카메라] 뷰 보정 시작 (Q 닮음 - N 닮음 ≥ %.2f)", CAMERA_LETTER_MARGIN)
     try:
         _hwnd, bx, by, cw, ch = _find_game_window()
     except Exception as e:
@@ -907,24 +1042,20 @@ def _run_camera_check(screen_sync=None):
     for i in range(CAMERA_CHECK_MAX_ITERS):
         _check_cancel()
         try:
-            present, score, _ = _match_region(
-                CAMERA_CHECK_IMAGE, CAMERA_CHECK_CENTER,
-                CAMERA_CHECK_W, CAMERA_CHECK_H,
-                bx, by, cw, ch,
-                CAMERA_CHECK_THRESHOLD)
+            q, n, icon_score = _camera_letter_score(bx, by, cw, ch)
         except Exception as e:
             logger.warning("[카메라] 매칭 실패 — 중단: %s", e)
             return
-        if present:
-            logger.info("[카메라] 뷰 일치 (score=%.2f, %d회차) — 완료",
-                        score, i + 1)
+        if _camera_is_q(q, n):
+            logger.info("[카메라] Q 모드 확인 (Q %.2f / N %.2f, 아이콘 %.2f, %d회차) — 완료",
+                        q, n, icon_score, i + 1)
             return
-        logger.debug("[카메라] 미일치 score=%.2f < %.2f → C 키 (%d회차)",
-                     score, CAMERA_CHECK_THRESHOLD, i + 1)
+        logger.info("[카메라] Q 모드 아님 (Q %.2f / N %.2f, 아이콘 %.2f) → C 키 (%d회차)",
+                    q, n, icon_score, i + 1)
         _press_key(_VK_C)
         _sleep_cancellable(CAMERA_CHECK_INTERVAL)
-    logger.warning("[카메라] %d회 시도 후 점수 %.2f 미달 — 타임아웃",
-                   CAMERA_CHECK_MAX_ITERS, CAMERA_CHECK_THRESHOLD)
+    logger.warning("[카메라] %d회 시도 후에도 Q 모드 확인 실패 — 타임아웃",
+                   CAMERA_CHECK_MAX_ITERS)
 
 
 # 대기열에서 꺼낼 때 이 시간 이하로 남았으면 스킵 (이동 완료 전에 스폰 지남)
@@ -1220,14 +1351,16 @@ class BossAutomator(QObject):
             logger.info(
                 "[자동화] 상태 TRACKING → IDLE ('%s' 종료)",
                 boss.config.display_name)
-            # 스킬 프리셋 기본값(A)으로 복귀 — 전투 끝났으니 기본 스킬셋으로
-            vk_a = SKILL_PRESET_KEYS.get("A")
-            if vk_a is not None:
+            # 전투 끝났으니 아이들(사냥) 프리셋으로 — 옵션에서 지정
+            from odin.automation.automation_config import get_idle_preset
+            idle_preset = get_idle_preset()
+            vk = SKILL_PRESET_KEYS.get(idle_preset)
+            if vk is not None:
                 try:
-                    _press_key(vk_a)
-                    logger.info("[자동화] 스킬 프리셋 'A' 로 복귀 (IDLE 전환)")
+                    _press_key(vk)
+                    logger.info("[자동화] 아이들 프리셋 '%s' 로 복귀 (IDLE 전환)", idle_preset)
                 except Exception as e:
-                    logger.warning("[자동화] 프리셋 A 키 입력 실패: %s", e)
+                    logger.warning("[자동화] 프리셋 %s 키 입력 실패: %s", idle_preset, e)
             self._state = self.STATE_IDLE
             self._current_boss = None
             self._idle_action_submitted = False

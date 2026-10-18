@@ -111,49 +111,97 @@ _PRESETS_JSON = DATA_DIR / "automation_presets.json"
 _SETTINGS_JSON = DATA_DIR / "automation_settings.json"
 
 
-def set_priority_enabled(enabled: bool) -> None:
-    """토글 변경 + 파일 저장 (다음 실행에도 유지)."""
-    global PRIORITY_ENABLED
-    PRIORITY_ENABLED = bool(enabled)
+def _save_settings() -> None:
+    """automation_settings.json 에 토글·프리셋 설정을 한꺼번에 기록."""
     try:
         _SETTINGS_JSON.write_text(
-            json.dumps({"priority_enabled": PRIORITY_ENABLED},
+            json.dumps({"priority_enabled": PRIORITY_ENABLED,
+                        "boss_preset": BOSS_PRESET,
+                        "idle_preset": IDLE_PRESET},
                        ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
     except Exception as e:
-        logger.warning("[자동화] 우선순위 설정 저장 실패: %s", e)
+        logger.warning("[자동화] 설정 저장 실패: %s", e)
+
+
+def set_priority_enabled(enabled: bool) -> None:
+    """토글 변경 + 파일 저장 (다음 실행에도 유지)."""
+    global PRIORITY_ENABLED
+    PRIORITY_ENABLED = bool(enabled)
+    _save_settings()
     logger.info("[자동화] 보스 우선순위 %s — %s",
                 "적용" if PRIORITY_ENABLED else "미적용",
                 "우선순위 순으로 실행" if PRIORITY_ENABLED else "스폰 빠른 순으로 실행")
 
 
 def load_runtime_settings() -> bool:
-    """automation_settings.json 에서 우선순위 토글 로드. 없으면 기본값(ON) 유지."""
-    global PRIORITY_ENABLED
+    """automation_settings.json 에서 우선순위 토글·프리셋 로드. 없으면 기본값 유지."""
+    global PRIORITY_ENABLED, BOSS_PRESET, IDLE_PRESET
     if not _SETTINGS_JSON.exists():
         return False
     try:
         data = json.loads(_SETTINGS_JSON.read_text(encoding="utf-8"))
         PRIORITY_ENABLED = bool(data.get("priority_enabled", True))
-        logger.info("[자동화] 우선순위 적용 = %s ← %s",
-                    PRIORITY_ENABLED, _SETTINGS_JSON.name)
+        if data.get("boss_preset") in PRESET_CHOICES:
+            BOSS_PRESET = data["boss_preset"]
+        if data.get("idle_preset") in PRESET_CHOICES:
+            IDLE_PRESET = data["idle_preset"]
+        logger.info("[자동화] 우선순위 적용 = %s, 프리셋 보스 %s / 아이들 %s ← %s",
+                    PRIORITY_ENABLED, BOSS_PRESET, IDLE_PRESET, _SETTINGS_JSON.name)
         return True
     except Exception as e:
-        logger.warning("[자동화] 우선순위 설정 로드 실패 (%s): %s",
+        logger.warning("[자동화] 설정 로드 실패 (%s): %s",
                        _SETTINGS_JSON.name, e)
         return False
 
 
-# === 스킬 프리셋 (보스별) ===
-# boss_name → 프리셋 문자("A" 또는 "C"). 지정 없으면 "A" 로 간주.
-# 도착 시 G+F 다음에 눌릴 키는 automator.SKILL_PRESET_KEYS 에서 매핑됨.
+# === 스킬 프리셋 ===
+# 프리셋 → 게임에서 그 프리셋으로 바꾸는 키 (Virtual-Key, 표시 이름).
+#   BOSS_PRESET — 보스 도착 후 G+F 다음에 누름. 보스별 예외는 AUTOMATION_PRESETS
+#   IDLE_PRESET — 보스가 끝나 아이들(사냥)로 돌아갈 때 누름
+PRESET_KEYS: dict[str, tuple[int, str]] = {
+    "A": (0x2E, "Delete"),
+    "B": (0x23, "End"),
+    "C": (0x22, "PageDown"),
+    "D": (0x2D, "Insert"),
+    "E": (0x24, "Home"),
+}
+PRESET_CHOICES = tuple(PRESET_KEYS)
+
+
+def preset_label(preset: str) -> str:
+    """'A (Delete)' 형태 — GUI 표시용."""
+    return f"{preset} ({PRESET_KEYS[preset][1]})" if preset in PRESET_KEYS else preset
+BOSS_PRESET = "A"
+IDLE_PRESET = "A"
+# boss_name → 프리셋. 옵션의 보스 기본 프리셋과 다르게 쓸 보스만 들어 있다.
 AUTOMATION_PRESETS: dict[str, str] = {}
 
 
 def get_preset(boss_name: str) -> str:
-    """보스의 스킬 프리셋 조회. 미지정 시 'A'."""
-    return AUTOMATION_PRESETS.get(boss_name, "A")
+    """보스의 스킬 프리셋 — 보스별 예외가 없으면 옵션의 보스 기본 프리셋."""
+    return AUTOMATION_PRESETS.get(boss_name) or BOSS_PRESET
+
+
+def get_idle_preset() -> str:
+    return IDLE_PRESET
+
+
+def set_boss_preset(preset: str) -> None:
+    global BOSS_PRESET
+    if preset in PRESET_CHOICES:
+        BOSS_PRESET = preset
+        _save_settings()
+        logger.info("[자동화] 보스 기본 프리셋 = %s", preset)
+
+
+def set_idle_preset(preset: str) -> None:
+    global IDLE_PRESET
+    if preset in PRESET_CHOICES:
+        IDLE_PRESET = preset
+        _save_settings()
+        logger.info("[자동화] 아이들 프리셋 = %s", preset)
 
 
 def load_runtime_presets() -> bool:
@@ -174,9 +222,9 @@ def load_runtime_presets() -> bool:
 
 
 def save_runtime_presets() -> bool:
-    """현재 AUTOMATION_PRESETS 를 저장 (기본값 'A' 는 파일에서 생략)."""
+    """현재 AUTOMATION_PRESETS(보스별 예외) 를 저장."""
     try:
-        filtered = {k: v for k, v in AUTOMATION_PRESETS.items() if v != "A"}
+        filtered = {k: v for k, v in AUTOMATION_PRESETS.items() if v in PRESET_CHOICES}
         _PRESETS_JSON.write_text(
             json.dumps(filtered, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -190,9 +238,9 @@ def save_runtime_presets() -> bool:
 
 
 def update_presets(mapping: dict[str, str]) -> None:
-    """GUI에서 편집된 프리셋 매핑으로 AUTOMATION_PRESETS 를 교체."""
+    """GUI에서 편집된 보스별 예외 매핑으로 AUTOMATION_PRESETS 를 교체."""
     AUTOMATION_PRESETS.clear()
-    AUTOMATION_PRESETS.update(mapping)
+    AUTOMATION_PRESETS.update({k: v for k, v in mapping.items() if v in PRESET_CHOICES})
 
 
 def load_runtime_targets() -> bool:

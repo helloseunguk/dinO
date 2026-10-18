@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 
 from odin.automation.automator import (
-    AUTO_IMAGE_CENTER, _wait_for_auto_image, _sleep_cancellable,
+    AUTO_CLICK_POS, _wait_for_auto_image, _sleep_cancellable,
 )
 from odin.game.game_coords import click_base as _click_game_base
 from odin.sync.screen_sync import _find_game_window
@@ -49,9 +49,9 @@ def main():
     auto_detected = _wait_for_auto_image(bx, by, cw, ch)
 
     if auto_detected:
-        print(f"\n>>> 감지됨. 1.5s 안정화 → AUTO 위치 클릭 BASE={AUTO_IMAGE_CENTER}")
+        print(f"\n>>> 감지됨. 1.5s 안정화 → AUTO 위치 클릭 BASE={AUTO_CLICK_POS}")
         _sleep_cancellable(1.5)
-        _click_game_base(AUTO_IMAGE_CENTER, bx, by, cw, ch)
+        _click_game_base(AUTO_CLICK_POS, bx, by, cw, ch)
         print(">>> 클릭 완료")
     else:
         print("\n>>> 미감지 — 종료")
