@@ -265,6 +265,18 @@ CAMERA_N_IMAGE = "camera_n.png"      # N 모드 아이콘 (camera2.png 와 같�
 CAMERA_LETTER_BOX = (8, 6, 23, 23)   # 아이콘 안 글자 영역 (x0, y0, x1, y1)
 CAMERA_LETTER_MARGIN = 0.05          # Q 닮음 - N 닮음 이 이 이상이어야 Q
 CAMERA_LETTER_MIN = 0.45             # 아이콘이 아예 안 보일 때(로딩 등) 오판 방지
+# 글자보다 먼저 보는 것: 아이콘 아래 3칸 막대. 켜진 칸만 불투명 순백(255)이고 나머지는
+# 반투명이라, 배경이 바뀌어도 "어느 칸이 제일 밝은가" 는 안 바뀐다. C 키를 누를 때마다
+# 가운데(Q) → 오른쪽(D) → 왼쪽(N) 순으로 돈다. 글자 비교는 Q 와 D 가 둘 다
+# Q 0.42~0.44 로 붙어서 가르지 못했다 — 어두운 바닥에서 Q 인데 Q 아님으로 C 를 눌러
+# 30회 가까이 돈 적이 있다. 막대는 같은 화면에서 켜진 칸 255 / 나머지 80 (2026-10-18 실측).
+# D 가 오른쪽이라는 것은 로그의 순환 순서로 짐작한 것이다 (화면으로는 아직 못 봄).
+CAMERA_BAR_SEGMENTS = ((4, 10), (12, 17), (19, 25))  # 아이콘 템플릿 기준 x 구간 (끝 포함)
+CAMERA_BAR_NAMES = ("N", "Q", "D")   # 칸 순서대로의 모드
+CAMERA_BAR_ROWS = (25, 31)           # 막대를 찾을 템플릿 기준 y 범위 (막대는 28~29행)
+CAMERA_BAR_Q = 1                     # Q 모드일 때 켜지는 칸 (가운데)
+CAMERA_BAR_LIT_MIN = 230             # 켜진 칸의 최소 밝기
+CAMERA_BAR_GAP_MIN = 40              # 켜진 칸이 다음 밝은 칸보다 이만큼은 밝아야 함
 CAMERA_CHECK_INTERVAL = 1.0
 CAMERA_CHECK_MAX_ITERS = 30
 
@@ -1003,10 +1015,40 @@ def _camera_letter_scores(crop_gray: np.ndarray) -> tuple[float, float]:
     return scores[0], scores[1]
 
 
+def _camera_bar_mode(crop_gray: np.ndarray) -> tuple[int | None, float, float]:
+    """아이콘 crop(사방 _CAMERA_LETTER_PAD 여유 포함, 흑백) 의 모드 막대에서 켜진 칸.
+    위치 오차를 흡수하려고 행·열을 조금씩 옮겨 보며 켜진 칸이 가장 뚜렷한 자리를 쓴다.
+    반환: (켜진 칸 0/1/2 — 못 읽으면 None, 켜진 칸 밝기, 다음 밝은 칸 밝기)
+    """
+    pad = _CAMERA_LETTER_PAD
+    h, w = crop_gray.shape[:2]
+    best = (None, 0.0, 0.0)
+    best_gap = -1.0
+    for y in range(CAMERA_BAR_ROWS[0] + pad, min(h, CAMERA_BAR_ROWS[1] + pad + 1)):
+        for dx in range(-pad, pad + 1):
+            means = []
+            for x0, x1 in CAMERA_BAR_SEGMENTS:
+                a, b = x0 + pad + dx, x1 + pad + dx + 1
+                if a < 0 or b > w:
+                    break
+                means.append(float(crop_gray[y, a:b].mean()))
+            if len(means) < len(CAMERA_BAR_SEGMENTS):
+                continue
+            order = sorted(range(len(means)), key=means.__getitem__, reverse=True)
+            lit, second = means[order[0]], means[order[1]]
+            if lit - second > best_gap:
+                best_gap = lit - second
+                best = (order[0], lit, second)
+    idx, lit, second = best
+    if idx is None or lit < CAMERA_BAR_LIT_MIN or lit - second < CAMERA_BAR_GAP_MIN:
+        return None, lit, second
+    return idx, lit, second
+
+
 def _camera_letter_score(bx: int, by: int, cw: int, ch: int
-                         ) -> tuple[float, float, float]:
-    """카메라 아이콘을 찾아 그 안 글자의 Q/N 닮음 점수.
-    반환: (Q 닮음, N 닮음, 아이콘 전체 점수)
+                         ) -> tuple[float, float, float, int | None]:
+    """카메라 아이콘을 찾아 그 안 글자의 Q/N 닮음 점수와 모드 막대의 켜진 칸.
+    반환: (Q 닮음, N 닮음, 아이콘 전체 점수, 켜진 칸 — 못 읽으면 None)
     """
     template = _load_image_template(CAMERA_CHECK_IMAGE)
     _, icon_score, (ax, ay) = _match_region(
@@ -1020,10 +1062,14 @@ def _camera_letter_score(bx: int, by: int, cw: int, ch: int
     crop = cv2.cvtColor(np.array(Image.frombytes(
         "RGB", (shot.width, shot.height), shot.rgb)), cv2.COLOR_RGB2GRAY)
     q, n = _camera_letter_scores(crop)
-    return q, n, icon_score
+    bar, _lit, _second = _camera_bar_mode(crop)
+    return q, n, icon_score, bar
 
 
-def _camera_is_q(q: float, n: float) -> bool:
+def _camera_is_q(q: float, n: float, bar: int | None = None) -> bool:
+    """막대를 읽었으면 막대로, 못 읽었으면(아이콘 가림·로딩 등) 글자 비교로 판정."""
+    if bar is not None:
+        return bar == CAMERA_BAR_Q
     return q >= CAMERA_LETTER_MIN and q - n >= CAMERA_LETTER_MARGIN
 
 
@@ -1033,7 +1079,8 @@ def _run_camera_check(screen_sync=None):
     CAMERA_CHECK_INTERVAL 간격으로 C 키 반복. 최대 CAMERA_CHECK_MAX_ITERS 회.
     """
     _cancel_event.clear()
-    logger.info("[카메라] 뷰 보정 시작 (Q 닮음 - N 닮음 ≥ %.2f)", CAMERA_LETTER_MARGIN)
+    logger.info("[카메라] 뷰 보정 시작 (모드 막대 가운데 칸, 못 읽으면 Q 닮음 - N 닮음 ≥ %.2f)",
+                CAMERA_LETTER_MARGIN)
     try:
         _hwnd, bx, by, cw, ch = _find_game_window()
     except Exception as e:
@@ -1042,16 +1089,17 @@ def _run_camera_check(screen_sync=None):
     for i in range(CAMERA_CHECK_MAX_ITERS):
         _check_cancel()
         try:
-            q, n, icon_score = _camera_letter_score(bx, by, cw, ch)
+            q, n, icon_score, bar = _camera_letter_score(bx, by, cw, ch)
         except Exception as e:
             logger.warning("[카메라] 매칭 실패 — 중단: %s", e)
             return
-        if _camera_is_q(q, n):
-            logger.info("[카메라] Q 모드 확인 (Q %.2f / N %.2f, 아이콘 %.2f, %d회차) — 완료",
-                        q, n, icon_score, i + 1)
+        bar_txt = "?" if bar is None else CAMERA_BAR_NAMES[bar]
+        if _camera_is_q(q, n, bar):
+            logger.info("[카메라] Q 모드 확인 (막대 %s, Q %.2f / N %.2f, 아이콘 %.2f, %d회차) — 완료",
+                        bar_txt, q, n, icon_score, i + 1)
             return
-        logger.info("[카메라] Q 모드 아님 (Q %.2f / N %.2f, 아이콘 %.2f) → C 키 (%d회차)",
-                    q, n, icon_score, i + 1)
+        logger.info("[카메라] Q 모드 아님 (막대 %s, Q %.2f / N %.2f, 아이콘 %.2f) → C 키 (%d회차)",
+                    bar_txt, q, n, icon_score, i + 1)
         _press_key(_VK_C)
         _sleep_cancellable(CAMERA_CHECK_INTERVAL)
     logger.warning("[카메라] %d회 시도 후에도 Q 모드 확인 실패 — 타임아웃",
