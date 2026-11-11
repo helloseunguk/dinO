@@ -531,35 +531,43 @@ class OptionsDialog(QDialog):
         layout.addRow("스킵 옵션:", self.chk_skip_short)
 
         # 발할라 대전 자동 참가 — automator.valhalla_auto 직결
-        self.chk_valhalla = QCheckBox("등록 시간에 보스가 비면 발할라 대전 자동 참가")
+        self.chk_valhalla = QCheckBox("일정 시각이 되면 발할라 대전 자동 참가 (보스 우선)")
         self.chk_valhalla.setChecked(
             getattr(automator, "valhalla_auto", True) if automator else True)
         self.chk_valhalla.setToolTip(
-            "보스가 우선 — 다음 보스 출발까지 한 판(8분) 여유가 있을 때만 참가")
+            "보드 일정의 '발할라 대전' 시각부터 30분 안에, 다음 보스 출발까지\n"
+            "한 판(8분) 여유가 있을 때 참가. 시간표 갱신이 API 일 때만 동작")
         if automator is not None:
             self.chk_valhalla.toggled.connect(
                 lambda on: setattr(automator, "valhalla_auto", on))
         layout.addRow("발할라 대전:", self.chk_valhalla)
 
+        # 월드보스 순회 — automator.world_boss_auto 직결
+        self.chk_world_boss = QCheckBox("월드보스 시각이 되면 자동 순회 (필드 보스보다 우선)")
+        self.chk_world_boss.setChecked(
+            getattr(automator, "world_boss_auto", True) if automator else True)
+        self.chk_world_boss.setToolTip(
+            "보드 일정의 '월드보스' 90초 전에 시작 — 가릉 → 아우둠라 → 해임달 → 이둔,\n"
+            "보스당 4번 죽으면 다음으로, 끝나면 경험치 무료 복구. 시간표 갱신이 API 일 때만 동작")
+        if automator is not None:
+            self.chk_world_boss.toggled.connect(
+                lambda on: setattr(automator, "world_boss_auto", on))
+        layout.addRow("월드보스:", self.chk_world_boss)
+
         # 스킬 프리셋 — 게임에서 키보드 A~E 로 바뀌는 프리셋
         from odin.automation import automation_config as ac
-        self.cb_boss_preset = QComboBox()
-        self.cb_idle_preset = QComboBox()
-        for p in ac.PRESET_CHOICES:
-            self.cb_boss_preset.addItem(ac.preset_label(p), p)
-            self.cb_idle_preset.addItem(ac.preset_label(p), p)
-        self.cb_boss_preset.setCurrentIndex(self.cb_boss_preset.findData(ac.BOSS_PRESET))
-        self.cb_idle_preset.setCurrentIndex(self.cb_idle_preset.findData(ac.IDLE_PRESET))
-        self.cb_boss_preset.currentIndexChanged.connect(
-            lambda i: ac.set_boss_preset(self.cb_boss_preset.itemData(i)))
-        self.cb_idle_preset.currentIndexChanged.connect(
-            lambda i: ac.set_idle_preset(self.cb_idle_preset.itemData(i)))
+        self.cb_boss_preset = self._preset_combo(ac.BOSS_PRESET, ac.set_boss_preset)
+        self.cb_idle_preset = self._preset_combo(ac.IDLE_PRESET, ac.set_idle_preset)
+        self.cb_valhalla_preset = self._preset_combo(ac.VALHALLA_PRESET, ac.set_valhalla_preset)
         self.cb_boss_preset.setToolTip(
             "보스 앞에 도착해 G+F 다음에 누를 프리셋 키.\n"
             "보스마다 다르게 하려면 '우선순위 편집…' 에서 지정")
-        self.cb_idle_preset.setToolTip("보스가 끝나 사냥(아이들)으로 돌아갈 때 누를 프리셋 키")
+        self.cb_idle_preset.setToolTip(
+            "아이들(사냥) 시퀀스를 시작할 때, 보스·월보·발할라가 끝나 돌아갈 때 누를 프리셋 키")
+        self.cb_valhalla_preset.setToolTip("발할라 대전 경기장에 들어갈 때 누를 프리셋 키")
         layout.addRow("보스 프리셋:", self.cb_boss_preset)
         layout.addRow("아이들 프리셋:", self.cb_idle_preset)
+        layout.addRow("발할라 프리셋:", self.cb_valhalla_preset)
 
         # 우선순위 편집 — 별도 다이얼로그 호출
         self.btn_priority = QPushButton("우선순위 편집…")
@@ -569,6 +577,17 @@ class OptionsDialog(QDialog):
         btns = QDialogButtonBox(QDialogButtonBox.Close, parent=self)
         btns.rejected.connect(self.accept)
         layout.addRow(btns)
+
+    @staticmethod
+    def _preset_combo(current: str, on_change) -> QComboBox:
+        """프리셋 A~E 콤보 — 'A (Delete)' 표시, 고르는 즉시 on_change(프리셋) 로 저장."""
+        from odin.automation import automation_config as ac
+        cb = QComboBox()
+        for p in ac.PRESET_CHOICES:
+            cb.addItem(ac.preset_label(p), p)
+        cb.setCurrentIndex(cb.findData(current))
+        cb.currentIndexChanged.connect(lambda i: on_change(cb.itemData(i)))
+        return cb
 
     def _on_sync_source_changed(self, idx: int):
         source = self.cb_sync_source.itemData(idx)
@@ -1349,12 +1368,6 @@ class MainWindow(QMainWindow):
         self.btn_sync.clicked.connect(self._on_sync_clicked)
         tb.addWidget(self.btn_sync)
 
-        # 발할라 대전 — 참가 등록 시간에 누르면 참가 → 자동 전투 → 필드 복귀까지
-        self.btn_valhalla = self._toolbar_button(
-            "🏟 발할라", "발할라 대전 참가 → 자동 전투 → 결과 닫고 필드 복귀 (Ctrl+Esc 로 중단)")
-        self.btn_valhalla.clicked.connect(self._on_valhalla_clicked)
-        tb.addWidget(self.btn_valhalla)
-
         # 화면 녹화 — 새 자동화를 만들 근거 자료 (게임 창 영상 + 클릭·키 기록)
         self.btn_record = self._toolbar_button(
             "⏺ 녹화", "게임 화면 녹화 + 클릭·키 입력 기록 (recordings 폴더)",
@@ -1667,15 +1680,6 @@ class MainWindow(QMainWindow):
     def _on_sync_clicked(self):
         logger.info("[클릭] 🔄 수동 동기화 버튼")
         self.scheduler.trigger_sync_now()
-
-    def _on_valhalla_clicked(self):
-        logger.info("[클릭] 🏟 발할라 버튼")
-        automator = getattr(self.scheduler, "automator", None)
-        if automator is None:
-            logger.warning("[발할라] automator 없음 — 실행 불가")
-            return
-        from odin.automation.valhalla import run_valhalla
-        automator.run_content("발할라 대전", run_valhalla)
 
     # DEBUG 토글로 활성화할 모듈들 (라이브러리 로그 제외)
     _DEBUG_LOGGERS = [

@@ -31,7 +31,7 @@ except Exception:
 
 from odin.boss.boss_detector import (
     BOSS_ICON_CENTER, BOSS_ICON_HALF_W, BOSS_ICON_HALF_H,
-    MATCH_THRESHOLD, _load_template,
+    MATCH_THRESHOLD, _load_template, _scale_template,
 )
 from odin.sync.screen_sync import BASE_W, BASE_H, _find_game_window, _scale_xy, _scale_w, _scale_h
 
@@ -61,7 +61,7 @@ def main():
     hw_base = args.half[0] if args.half else BOSS_ICON_HALF_W
     hh_base = args.half[1] if args.half else BOSS_ICON_HALF_H
 
-    template = _load_template()
+    template, mask = _load_template()
     print(f"[템플릿] {template.shape[1]}x{template.shape[0]}")
     print(f"[설정] center={center} (BASE) | half={hw_base}x{hh_base} (BASE)")
     print(f"[설정] threshold={args.threshold} | interval={args.interval}s")
@@ -95,15 +95,7 @@ def main():
                 img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
                 # 템플릿 비율 스케일
-                sw, sh = cw / BASE_W, ch / BASE_H
-                tpl = template
-                if abs(sw - 1.0) > 0.02 or abs(sh - 1.0) > 0.02:
-                    tpl = cv2.resize(
-                        template,
-                        (max(1, int(template.shape[1] * sw)),
-                         max(1, int(template.shape[0] * sh))),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
+                tpl, tpl_mask = _scale_template(template, mask, cw, ch)
 
                 if (img_bgr.shape[0] < tpl.shape[0]
                         or img_bgr.shape[1] < tpl.shape[1]):
@@ -111,7 +103,8 @@ def main():
                     time.sleep(args.interval)
                     continue
 
-                result = cv2.matchTemplate(img_bgr, tpl, cv2.TM_CCOEFF_NORMED)
+                result = np.nan_to_num(cv2.matchTemplate(
+                    img_bgr, tpl, cv2.TM_CCOEFF_NORMED, mask=tpl_mask), nan=0.0, posinf=0.0, neginf=0.0)
                 _, max_val, _, max_loc = cv2.minMaxLoc(result)
                 present = max_val >= args.threshold
                 dt = (time.time() - t0) * 1000

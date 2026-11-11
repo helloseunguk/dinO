@@ -28,6 +28,9 @@ boss_debug/
 ocr_debug/
 icon_debug/
 arrival_debug/
+worldboss_debug/
+idle_debug/
+death_debug/
 recordings/
 
 # IDE / OS

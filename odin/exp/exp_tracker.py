@@ -7,6 +7,7 @@ IDLE(사냥 중)일 때만 SAMPLE_INTERVAL_SEC 마다 화면 왼쪽 아래 'EXP 
 사냥 구간:
   보스 자동화·사냥터 이동(idle_action)이 끝나고 IDLE 로 돌아온 뒤부터.
   다른 곳에서 오른 경험치가 섞이지 않게 이동이 생기면 구간을 새로 시작한다.
+  IDLE 로 들어올 때마다(▶ 시작·초기화 포함) 예상 시간도 지우고 처음부터 쌓는다.
   경험치가 줄면(레벨업·사망) 그때도 새로 시작한다.
 
 게임 조작이 없는 순수 캡처라 game_queue 를 타지 않는다. 다만 큐 태스크가
@@ -144,6 +145,8 @@ class ExpTracker(QObject):
 
         if game_queue is not None:
             game_queue.task_started.connect(self._on_task_started)
+        if automator is not None and hasattr(automator, "idle_entered"):
+            automator.idle_entered.connect(self._on_idle_entered)
 
     # ─── 외부 API ───────────────────────────────────
     def start(self) -> None:
@@ -170,20 +173,32 @@ class ExpTracker(QObject):
 
     # ─── 구간 관리 ───────────────────────────────────
     def _on_task_started(self, name: str):
-        # 캐릭터가 자리를 옮기는 태스크 — 지금까지의 기록은 다른 사냥터 것
-        if name == "idle_action" or name.startswith("automation:"):
+        # 캐릭터가 자리를 옮기는 태스크 — 지금까지의 기록은 다른 사냥터 것.
+        # content: 는 월보·발할라·부활(마을로 감)
+        if (name == "idle_action" or name.startswith("automation:")
+                or name.startswith("content:")):
             self._reset(f"이동 ({name})")
 
-    def _reset(self, reason: str, keep: list[tuple[float, float]] | None = None):
+    def _on_idle_entered(self, reason: str):
+        # IDLE 이 새로 시작될 때마다 예상 시간까지 처음부터 (사용자 요청 11/08) —
+        # 이전 구간의 기울기로 계속 보여 주면 지금 사냥과 맞지 않는다
+        self._reset(f"IDLE 시작 ({reason})", clear_estimate=True)
+
+    def _reset(self, reason: str, keep: list[tuple[float, float]] | None = None,
+               clear_estimate: bool = False):
         with self._lock:
             had = len(self._samples)
+            had_estimate = self._estimate is not None
             self._samples = list(keep or [])
             self._anomalies.clear()
-            # 직전 추정은 남겨 둔다 — 보스 다녀오는 동안에도 GUI 에 보이도록
+            # 보스 다녀오는 동안(이동)은 직전 추정을 남겨 GUI 에 보이게 하고,
+            # IDLE 로 다시 들어오면 지운다 — 새 구간이 쌓일 때까지 '기록 쌓는 중'
+            if clear_estimate:
+                self._estimate = None
             self._last_estimate_at = 0.0
-        if had:
-            logger.info("[경험치] 사냥 구간 새로 시작 — %s (이전 기록 %d개 버림)",
-                        reason, had)
+        if had or (clear_estimate and had_estimate):
+            logger.info("[경험치] 사냥 구간 새로 시작 — %s (이전 기록 %d개 버림%s)",
+                        reason, had, ", 예상 시간 초기화" if clear_estimate and had_estimate else "")
 
     def _add_sample(self, t: float, value: float):
         with self._lock:

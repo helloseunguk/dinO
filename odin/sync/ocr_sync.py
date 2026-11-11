@@ -26,16 +26,17 @@ import mss
 from PIL import Image
 
 from odin.sync.api_client import ApiClient
-from odin.game.game_coords import click_base, find_game_window, scale_xy
+from odin.game.game_coords import ensure_game_foreground
+from odin.game.game_coords import click_base, find_game_window, scale_xy, ui
 from odin.core.paths import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
 # ─── 좌표 (BASE 1920x1009) ─────────────────────────────────
-SCHEDULE_ICON = (30, 348)      # 노른의 시간표 아이콘
-SCHEDULE_CLOSE = (1596, 247)   # 시간표 닫기 X (screen_sync 와 동일 위치)
-CAPTURE_START = (300, 230)     # 캡처 영역 좌상단
-CAPTURE_END = (1615, 782)      # 캡처 영역 우하단
+SCHEDULE_ICON = ui(30, 348, "TL")   # 노른의 시간표 아이콘 (왼쪽 아이콘열 — 위쪽 기준)
+SCHEDULE_CLOSE = ui(1596, 247, "C")  # 시간표 닫기 X (screen_sync 와 동일 위치)
+CAPTURE_START = ui(300, 230, "C")   # 캡처 영역 좌상단
+CAPTURE_END = ui(1615, 782, "C")    # 캡처 영역 우하단
 
 # 보스 탭 — 선언 순서대로 순회한다 (클릭 → 캡처 → 다음)
 TAB_COORDS: dict[str, tuple[int, int]] = {
@@ -48,6 +49,8 @@ TAB_COORDS: dict[str, tuple[int, int]] = {
     "바나": (1399, 314),
     "던전": (1487, 314),
 }
+# 시간표 창은 화면 가운데 기준
+TAB_COORDS = {name: ui(*xy, "C") for name, xy in TAB_COORDS.items()}
 
 # 게임 창을 앞으로 가져온 뒤 입력이 먹을 때까지 대기.
 # 이 단계를 건너뛰면 터미널에 포커스가 있을 때 첫 클릭이 창 활성화로 소비돼
@@ -131,7 +134,7 @@ def _prune_debug(keep_files: int) -> None:
 def focus_game(hwnd: int) -> bool:
     """게임 창을 앞으로. 활성화에 실패하면 클릭이 엉뚱한 창으로 가므로 경고한다."""
     user32 = ctypes.windll.user32
-    user32.SetForegroundWindow(hwnd)
+    ensure_game_foreground()
     time.sleep(FOCUS_WAIT_SEC)
     active = user32.GetForegroundWindow()
     if active != hwnd:

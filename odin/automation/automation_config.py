@@ -117,7 +117,8 @@ def _save_settings() -> None:
         _SETTINGS_JSON.write_text(
             json.dumps({"priority_enabled": PRIORITY_ENABLED,
                         "boss_preset": BOSS_PRESET,
-                        "idle_preset": IDLE_PRESET},
+                        "idle_preset": IDLE_PRESET,
+                        "valhalla_preset": VALHALLA_PRESET},
                        ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
@@ -137,7 +138,7 @@ def set_priority_enabled(enabled: bool) -> None:
 
 def load_runtime_settings() -> bool:
     """automation_settings.json 에서 우선순위 토글·프리셋 로드. 없으면 기본값 유지."""
-    global PRIORITY_ENABLED, BOSS_PRESET, IDLE_PRESET
+    global PRIORITY_ENABLED, BOSS_PRESET, IDLE_PRESET, VALHALLA_PRESET
     if not _SETTINGS_JSON.exists():
         return False
     try:
@@ -147,8 +148,11 @@ def load_runtime_settings() -> bool:
             BOSS_PRESET = data["boss_preset"]
         if data.get("idle_preset") in PRESET_CHOICES:
             IDLE_PRESET = data["idle_preset"]
-        logger.info("[자동화] 우선순위 적용 = %s, 프리셋 보스 %s / 아이들 %s ← %s",
-                    PRIORITY_ENABLED, BOSS_PRESET, IDLE_PRESET, _SETTINGS_JSON.name)
+        if data.get("valhalla_preset") in PRESET_CHOICES:
+            VALHALLA_PRESET = data["valhalla_preset"]
+        logger.info("[자동화] 우선순위 적용 = %s, 프리셋 보스 %s / 아이들 %s / 발할라 %s ← %s",
+                    PRIORITY_ENABLED, BOSS_PRESET, IDLE_PRESET, VALHALLA_PRESET,
+                    _SETTINGS_JSON.name)
         return True
     except Exception as e:
         logger.warning("[자동화] 설정 로드 실패 (%s): %s",
@@ -159,7 +163,8 @@ def load_runtime_settings() -> bool:
 # === 스킬 프리셋 ===
 # 프리셋 → 게임에서 그 프리셋으로 바꾸는 키 (Virtual-Key, 표시 이름).
 #   BOSS_PRESET — 보스 도착 후 G+F 다음에 누름. 보스별 예외는 AUTOMATION_PRESETS
-#   IDLE_PRESET — 보스가 끝나 아이들(사냥)로 돌아갈 때 누름
+#   IDLE_PRESET — 아이들(사냥) 시퀀스 시작 때, 보스·월보·발할라가 끝나 돌아갈 때 누름
+#   VALHALLA_PRESET — 발할라 대전 경기장에 들어갈 때 누름
 PRESET_KEYS: dict[str, tuple[int, str]] = {
     "A": (0x2E, "Delete"),
     "B": (0x23, "End"),
@@ -175,6 +180,7 @@ def preset_label(preset: str) -> str:
     return f"{preset} ({PRESET_KEYS[preset][1]})" if preset in PRESET_KEYS else preset
 BOSS_PRESET = "A"
 IDLE_PRESET = "A"
+VALHALLA_PRESET = "D"   # 원래 valhalla.py 에 고정돼 있던 값
 # boss_name → 프리셋. 옵션의 보스 기본 프리셋과 다르게 쓸 보스만 들어 있다.
 AUTOMATION_PRESETS: dict[str, str] = {}
 
@@ -202,6 +208,18 @@ def set_idle_preset(preset: str) -> None:
         IDLE_PRESET = preset
         _save_settings()
         logger.info("[자동화] 아이들 프리셋 = %s", preset)
+
+
+def get_valhalla_preset() -> str:
+    return VALHALLA_PRESET
+
+
+def set_valhalla_preset(preset: str) -> None:
+    global VALHALLA_PRESET
+    if preset in PRESET_CHOICES:
+        VALHALLA_PRESET = preset
+        _save_settings()
+        logger.info("[자동화] 발할라 프리셋 = %s", preset)
 
 
 def load_runtime_presets() -> bool:

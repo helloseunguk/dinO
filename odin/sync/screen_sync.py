@@ -17,6 +17,7 @@ from PIL import Image
 
 from odin.boss.boss_config import TAB_BOSS_MAP, TAB_TIME_COORDS
 # 좌표·마우스 공용 헬퍼 (game_coords.py로 일원화)
+from odin.game.game_coords import ensure_game_foreground
 from odin.game.game_coords import (
     BASE_W, BASE_H,
     find_game_window as _find_game_window,
@@ -25,13 +26,14 @@ from odin.game.game_coords import (
     scale_h as _scale_h,
     click_game as _click_game,
     client_size as _client_size,
+    ui,
 )
 from odin.game.ocr_engine import ocr_lines
 
 logger = logging.getLogger(__name__)
 
-SCHEDULE_ICON = (29, 346)
-SCHEDULE_CLOSE = (1596, 247)
+SCHEDULE_ICON = ui(29, 346, "TL")   # 왼쪽 아이콘열 — 위쪽 기준
+SCHEDULE_CLOSE = ui(1596, 247, "C")  # 시간표 창은 화면 가운데 기준
 
 TAB_COORDS: dict[str, tuple[int, int]] = {
     # "미드가르드": (621, 307),  # 비활성화 — 동기화 시 탭 돌지 않음
@@ -44,6 +46,8 @@ TAB_COORDS: dict[str, tuple[int, int]] = {
     "바나하임":   (1364, 308),  # 기존 던전 자리 (탭이 한 칸씩 밀림)
     "던전":       (1456, 308),  # 오른쪽으로 한 칸 이동 (니플~던전 간격 92 적용). 필요시 mouse_monitor.py 로 검증
 }
+# 시간표 창은 화면 가운데 기준
+TAB_COORDS = {name: ui(*xy, "C") for name, xy in TAB_COORDS.items()}
 
 # 시간 텍스트 크롭 크기 (중심 기준, 기준 해상도에서)
 TIME_CROP_W = 250
@@ -87,7 +91,7 @@ class ScreenSync:
         self._sct: mss.mss | None = None  # sync_all 실행 중에만 활성
 
     def open_schedule(self, hwnd: int, bx: int, by: int, cw: int, ch: int):
-        ctypes.windll.user32.SetForegroundWindow(hwnd)
+        ensure_game_foreground()
         time.sleep(0.5)
         gx, gy = _scale_xy(SCHEDULE_ICON, cw, ch)
         _click_game(gx, gy, bx, by)

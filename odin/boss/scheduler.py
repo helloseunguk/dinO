@@ -11,6 +11,11 @@ from odin.boss import boss_store
 from odin.sync import sync_settings
 from odin.core.models import BossState, BossStatus
 from odin.sync.screen_sync import SPAWNED, ScreenSync
+from odin.automation.automator import WORLD_BOSS_LEAD_SEC
+
+# 보드 일정 API 의 컨텐츠 이름 그대로 (띄어쓰기 포함). 보드에서 이름을 바꾸면 같이 바꾼다.
+VALHALLA_CONTENT_NAME = "발할라 대전"
+WORLD_BOSS_CONTENT_NAME = "월드보스"
 
 logger = logging.getLogger(__name__)
 
@@ -330,8 +335,23 @@ class BossScheduler(QObject):
                 soon = sec - boss.config.alert_before.total_seconds()
                 if min_soon_sec is None or soon < min_soon_sec:
                     min_soon_sec = soon
+        # 일정은 API 동기화가 받아 온다 — 화면 캡처(OCR) 모드면 일정이 없어 둘 다 없다
+        def content_times(name: str) -> list[datetime]:
+            return self.api_sync.content_times(name) if self.api_sync is not None else []
+
+        world_slots = content_times(WORLD_BOSS_CONTENT_NAME)
         try:
-            self.automator.check_valhalla(min_soon_sec)
+            # 월드보스가 먼저 — 필드 보스 자동화도 끊고 들어간다
+            self.automator.check_world_boss(world_slots)
+        except Exception as e:
+            logger.warning("[월보] check_world_boss 실패: %s", e)
+        # 발할라 대전은 월드보스 출발도 '다음 보스 출발' 로 친다 — 한 판 도중에 월보 시간이 오면 안 된다
+        for s in world_slots:
+            sec = (s - now).total_seconds() - WORLD_BOSS_LEAD_SEC
+            if sec > 0 and (min_soon_sec is None or sec < min_soon_sec):
+                min_soon_sec = sec
+        try:
+            self.automator.check_valhalla(min_soon_sec, content_times(VALHALLA_CONTENT_NAME))
         except Exception as e:
             logger.warning("[발할라] check_valhalla 실패: %s", e)
         if not self.idle_enabled:

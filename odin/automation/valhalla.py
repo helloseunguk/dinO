@@ -6,7 +6,7 @@
   1) 왼쪽 '참가 등록 진행' 아래 아이콘 클릭 → "발할라 대전에 참가 하시겠습니까?" 확인
   2) 적대 범위 공격 바로가기가 꺼져 있으면 켠다 (꺼짐 = 회색, 켜짐 = 금색)
   3) 매칭 대기 — 그동안은 하던 사냥 그대로. 녹화에선 약 95초
-  4) 경기장 입장(오른쪽 위 주황 띠 '… 팀 순위') → 프리셋 D.
+  4) 경기장 입장(오른쪽 위 주황 띠 '… 팀 순위') → 발할라 프리셋 (옵션, 기본 D).
      그 뒤로는 자동 전투만 — AUTO 가 꺼져 있으면 G. 입장하면 AUTO 가 꺼진 채로 시작한다.
      사망 화면에선 아무것도 누르지 않는다. 부활은 저절로 되고, '나가기' 는 이탈이다.
   5) 결과 창(OCR 로 '보상'·'패배'·'승리') → 창을 클릭해 닫기
@@ -18,6 +18,7 @@
 
 import ctypes
 import logging
+import re
 import time
 
 import cv2
@@ -28,8 +29,11 @@ from PIL import Image
 from odin.automation.automator import (
     SKILL_PRESET_KEYS, _VK_G, _cancel_event, _check_cancel, _find_and_click,
     _match_region, _press_key, _sleep_cancellable, AutomationCancelled)
+from odin.game.game_coords import ensure_game_foreground
 from odin.game.game_coords import (
-    center_to_abs_region, click_at_screen, click_base, find_game_window)
+    center_to_abs_region, click_at_screen, click_base, find_game_window, grab_base,
+    scale_h, scale_w, ui)
+from odin.core.paths import BUNDLED_DIR
 from odin.game.ocr_engine import ocr_text
 
 logger = logging.getLogger(__name__)
@@ -61,18 +65,37 @@ CONFIRM_TIMEOUT_SEC = 5.0
 
 # ── 2) 적대 범위 공격 바로가기 (왼쪽 아이콘 열) ──────────────
 # 금색 픽셀 비율 — 꺼짐 0.00 (필드 4장), 켜짐 0.07~0.28 (필드·경기장 20장).
-HOSTILE_CENTER = (33, 396)
+HOSTILE_CENTER = ui(33, 396, "TL")   # 왼쪽 아이콘열 — 위쪽 기준
 HOSTILE_SIZE = 28
 HOSTILE_GOLD_MIN = 0.04
 HOSTILE_MAX_CLICKS = 2     # 누를 때마다 뒤집히므로 오판이면 두 번째 클릭이 되돌린다
+# 같은 자리에 칼 아이콘 대신 번개 배터리 아이콘이 있을 때가 있다(10/30 새벽 이후 4K·QHD 화면).
+# 그때도 '꺼짐' 으로 보고 두 번씩 눌렀다 — 칼 모양(회색·금색 모두)일 때만 누른다.
+# 칼 템플릿 점수: 회색 0.87 · 금색 0.73 / 배터리 0.16~0.28 · 로딩 0.13.
+HOSTILE_ICON_PATH = BUNDLED_DIR / "images" / "hostile_swords.png"
+HOSTILE_ICON_MIN = 0.55
+_hostile_icon_cache: np.ndarray | None = None
 
-# ── 4) 경기장 판정: 오른쪽 위 주황 띠 '… 팀 순위' ─────────────
-# 글자 왼쪽의 빈 띠만 본다. 팀 이름은 경기마다 다를 수 있다.
+# ── 4) 경기장 판정 ─────────────────────────────────────
+# 오른쪽 위 '… 팀 순위' 띠가 주황이면 바로 경기장으로 본다 (카운트다운 중에도 보인다).
 # 띠 중앙값 색이 경기장 BGR (9~35, 56~99, 112~185), 필드·사망 화면은 R < 80.
+#
+# 하지만 색만으로는 부족했다 — 10-18 21:00 회차에 실제로 경기를 치렀는데 한 번도
+# 경기장으로 못 봤다. 녹화(18:15)에선 우리가 '바니르(아군)' 이었고, 주황은 팀/아군
+# 표시 색이라 편이 바뀌면 띠 색도 바뀌는 것으로 보인다.
+# 그래서 왼쪽 킬 현황판의 팀 이름('에시르  바니르(아군)')과 남은 시간('4분 46초 남음')을
+# OCR 로 함께 본다. 어느 편이든 같은 자리·같은 글자다. 녹화에서 살아 있는 경기 화면
+# 61장 모두 읽혔고, 필드·사망 화면 51장은 한 장도 안 읽혔다.
 ARENA_BAR_CENTER = (1635, 96)
 ARENA_BAR_W = 76
 ARENA_BAR_H = 14
-VALHALLA_PRESET = "D"
+ARENA_TEAMS_CENTER = ui(160, 343, "TL")
+ARENA_TEAMS_W, ARENA_TEAMS_H = 200, 26
+ARENA_TIMER_CENTER = (150, 310)
+ARENA_TIMER_W, ARENA_TIMER_H = 200, 26
+_ARENA_TEAMS_RE = re.compile(r"에시|바니")
+_ARENA_TIMER_RE = re.compile(r"남음|\d+\s*초")
+# 입장 때 누를 프리셋은 옵션 — automation_config.VALHALLA_PRESET (기본 D)
 
 # AUTO 링 — 버튼 둘레에서 도는 밝은 화살표. 글자(반지름 14 안쪽)는 뺀다.
 # 링 자리의 밝은 픽셀 비율이 꺼짐 0.00, 켜짐 0.09~0.17.
@@ -101,19 +124,27 @@ FIELD_FALLBACK_SEC = 10.0
 
 
 def _grab(center, w, h, win) -> np.ndarray:
-    """BASE 중심·크기 영역을 BGR 로 캡처."""
+    """BASE 중심·크기 영역을 BASE 크기의 BGR 로 캡처."""
     _hwnd, bx, by, cw, ch = win
     region = center_to_abs_region(center, w, h, bx, by, cw, ch)
-    with mss.mss() as sct:
-        shot = sct.grab(region)
-    rgb = np.array(Image.frombytes("RGB", (shot.width, shot.height), shot.rgb))
-    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    return cv2.cvtColor(grab_base(region, cw, ch), cv2.COLOR_RGB2BGR)
+
+
+def _ocr_box(center, w, h, win) -> str:
+    img = _grab(center, w, h, win)
+    big = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    return ocr_text(cv2.cvtColor(big, cv2.COLOR_BGR2RGB))
 
 
 def _in_arena(win) -> bool:
     b, g, r = (float(v) for v in np.median(
         _grab(ARENA_BAR_CENTER, ARENA_BAR_W, ARENA_BAR_H, win).reshape(-1, 3), 0))
-    return r >= 100 and r - b >= 70 and 0.3 * r <= g <= 0.7 * r
+    if r >= 100 and r - b >= 70 and 0.3 * r <= g <= 0.7 * r:
+        return True
+    if _ARENA_TEAMS_RE.search(_ocr_box(ARENA_TEAMS_CENTER, ARENA_TEAMS_W, ARENA_TEAMS_H, win)):
+        return True
+    return bool(_ARENA_TIMER_RE.search(
+        _ocr_box(ARENA_TIMER_CENTER, ARENA_TIMER_W, ARENA_TIMER_H, win)))
 
 
 def _auto_ratio(win) -> float:
@@ -130,6 +161,16 @@ def _hostile_ratio(win) -> float:
     img = _grab(HOSTILE_CENTER, HOSTILE_SIZE, HOSTILE_SIZE, win).astype(int)
     b, g, r = img[..., 0], img[..., 1], img[..., 2]
     return float(((r > 170) & (g > 130) & (r - b > 60)).mean())
+
+
+def _hostile_icon_score(win) -> float:
+    """그 자리가 적대 범위 공격(칼) 아이콘인가 — 회색·금색 모두 모양으로 본다."""
+    global _hostile_icon_cache
+    if _hostile_icon_cache is None:
+        _hostile_icon_cache = cv2.cvtColor(cv2.imread(str(HOSTILE_ICON_PATH)), cv2.COLOR_BGR2GRAY)
+    img = cv2.cvtColor(_grab(HOSTILE_CENTER, HOSTILE_SIZE * 2, HOSTILE_SIZE * 2, win),
+                       cv2.COLOR_BGR2GRAY)
+    return float(cv2.matchTemplate(img, _hostile_icon_cache, cv2.TM_CCOEFF_NORMED).max())
 
 
 def _hud_visible(win) -> bool:
@@ -163,7 +204,12 @@ def _ensure_hostile_on(win):
             return
         if i == HOSTILE_MAX_CLICKS:
             break
-        logger.info("[발할라] 적대 범위 공격 꺼짐 (금색 %.2f) → 클릭", ratio)
+        icon = _hostile_icon_score(win)
+        if icon < HOSTILE_ICON_MIN:
+            logger.warning("[발할라] 그 자리에 적대 범위 공격(칼) 아이콘이 없음 (모양 %.2f) — 누르지 않음",
+                           icon)
+            return
+        logger.info("[발할라] 적대 범위 공격 꺼짐 (금색 %.2f, 모양 %.2f) → 클릭", ratio, icon)
         click_base(HOSTILE_CENTER, bx, by, cw, ch)
         _sleep_cancellable(1.0)
     logger.warning("[발할라] 적대 범위 공격을 켰는지 확인 못 함 — 그대로 진행")
@@ -247,10 +293,10 @@ def _wait_for_field(win) -> bool:
 def _join_label(abs_xy, win) -> tuple[float, float]:
     """참가 아이콘 아래 글자의 (흰 비율, 노랑 비율)."""
     _hwnd, bx, by, cw, ch = win
-    w = max(1, round(JOIN_LABEL_W * cw / 1920))
-    h = max(1, round(JOIN_LABEL_H * ch / 1009))
-    cx = abs_xy[0] + round(JOIN_LABEL_OFFSET[0] * cw / 1920)
-    cy = abs_xy[1] + round(JOIN_LABEL_OFFSET[1] * ch / 1009)
+    w = max(1, scale_w(JOIN_LABEL_W, cw))
+    h = max(1, scale_h(JOIN_LABEL_H, ch))
+    cx = abs_xy[0] + scale_w(JOIN_LABEL_OFFSET[0], cw)
+    cy = abs_xy[1] + scale_h(JOIN_LABEL_OFFSET[1], ch)
     with mss.mss() as sct:
         shot = sct.grab({"left": cx - w // 2, "top": cy - h // 2, "width": w, "height": h})
     p = np.array(Image.frombytes("RGB", (shot.width, shot.height), shot.rgb)).astype(int)
@@ -260,18 +306,8 @@ def _join_label(abs_xy, win) -> tuple[float, float]:
     return white, yellow
 
 
-def registration_open() -> bool:
-    """지금 참가 등록이 열려 있는가 — 아이콘 + 흰 카운트다운. 클릭·키 입력 없이 보기만 한다.
-    스케줄러 틱(GUI 스레드)에서 부르므로 한 번만 캡처하고 끝낸다."""
-    try:
-        win = find_game_window()
-        _hwnd, bx, by, cw, ch = win
-        present, _score, abs_xy = _match_region(
-            JOIN_IMAGE, JOIN_CENTER, JOIN_W, JOIN_H, bx, by, cw, ch, JOIN_THRESHOLD)
-        return present and _join_label(abs_xy, win)[0] >= JOIN_WHITE_MIN
-    except Exception as e:
-        logger.debug("[발할라] 등록 확인 실패: %s", e)
-        return False
+class RegistrationClosed(Exception):
+    """참가 아이콘 자체가 없다 — 이 회차는 더 시도해도 소용없다."""
 
 
 def _join(win) -> bool:
@@ -304,7 +340,7 @@ def _join(win) -> bool:
         return False
     if icon_seen:
         raise TimeoutError("참가 아이콘은 있지만 등록 가능 표시(흰 카운트다운)도 '매칭중' 도 없음")
-    raise TimeoutError("참가 등록 아이콘 없음 — 등록 시간이 아님")
+    raise RegistrationClosed("참가 등록 아이콘 없음 — 등록이 끝났거나 이미 치렀음")
 
 
 def run_valhalla():
@@ -314,17 +350,23 @@ def run_valhalla():
     try:
         win = find_game_window()
         hwnd, bx, by, cw, ch = win
-        ctypes.windll.user32.SetForegroundWindow(hwnd)
+        ensure_game_foreground()
         _sleep_cancellable(0.5)
 
-        if _join(win):
-            _sleep_cancellable(1.0)
+        try:
+            if _join(win):
+                _sleep_cancellable(1.0)
+        except RegistrationClosed as e:
+            # 실패로 끝내면 2분마다 다시 들어와 창을 잡아챈다. 정상 종료로 회차를 닫는다.
+            logger.info("[발할라] %s — 이번 회차는 끝", e)
+            return
 
         _ensure_hostile_on(win)
 
         if not _wait_for_arena(win):
             raise TimeoutError(f"{MATCH_TIMEOUT_SEC / 60:.0f}분 안에 매칭 안 됨")
-        _press_preset(VALHALLA_PRESET, "경기장 입장")
+        from odin.automation.automation_config import get_valhalla_preset
+        _press_preset(get_valhalla_preset(), "경기장 입장")
 
         if _fight_until_result(win):
             if not _wait_for_field(win):

@@ -22,7 +22,7 @@ except Exception:
 
 from odin.boss.boss_detector import (
     BOSS_ICON_CENTER, BOSS_ICON_HALF_W, BOSS_ICON_HALF_H,
-    MATCH_THRESHOLD, _load_template,
+    MATCH_THRESHOLD, _load_template, _scale_template,
 )
 from odin.sync.screen_sync import BASE_W, BASE_H, _find_game_window, _scale_xy, _scale_w, _scale_h
 
@@ -31,7 +31,7 @@ OUT_DIR = Path(__file__).resolve().parents[1] / "boss_debug"
 
 def main():
     OUT_DIR.mkdir(exist_ok=True)
-    template = _load_template()
+    template, mask = _load_template()
     hwnd, bx, by, cw, ch = _find_game_window()
 
     cx, cy = _scale_xy(BOSS_ICON_CENTER, cw, ch)
@@ -52,17 +52,10 @@ def main():
     img_rgb = np.array(Image.frombytes("RGB", (shot.width, shot.height), shot.rgb))
     img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
-    sw, sh = cw / BASE_W, ch / BASE_H
-    tpl = template
-    if abs(sw - 1.0) > 0.02 or abs(sh - 1.0) > 0.02:
-        tpl = cv2.resize(
-            template,
-            (max(1, int(template.shape[1] * sw)),
-             max(1, int(template.shape[0] * sh))),
-            interpolation=cv2.INTER_LINEAR,
-        )
+    tpl, tpl_mask = _scale_template(template, mask, cw, ch)
 
-    result = cv2.matchTemplate(img_bgr, tpl, cv2.TM_CCOEFF_NORMED)
+    result = np.nan_to_num(cv2.matchTemplate(
+        img_bgr, tpl, cv2.TM_CCOEFF_NORMED, mask=tpl_mask), nan=0.0, posinf=0.0, neginf=0.0)
     _, max_val, _, max_loc = cv2.minMaxLoc(result)
     present = max_val >= MATCH_THRESHOLD
 

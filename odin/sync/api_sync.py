@@ -9,6 +9,7 @@
 """
 
 import logging
+import re
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -28,17 +29,60 @@ API_TIME_OFFSET = timedelta(minutes=1)
 # 매칭: config 보스 이름 == API 원본 이름(name). 별칭(displayName)·지역은 무시.
 # 이름이 어긋나면 매핑을 추가하지 말고 config 이름을 API 원본 이름에 맞춘다.
 
+# 보스가 아닌 일정(kind='content') — 월드보스·발할라 대전 등.
+# 행에 "HH:MM" 만 있고 날짜는 바로 위 날짜 구분 행("오늘 2026-10-18")에 있다.
+# 서버는 **지난 회차를 내려주지 않으므로** 받은 시각을 여기서 들고 있는다 —
+# 18:00 이 지나면 18:00 행이 사라지는데, 참가는 그 뒤에도 해야 한다.
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+CONTENT_KEEP = timedelta(hours=2)   # 지난 회차를 이만큼은 기억
+
+
+def parse_contents(rows: list[dict]) -> list[tuple[str, datetime]]:
+    """타임라인 행 → [(컨텐츠 이름, 시작 시각)]. 날짜를 모르는 행은 버린다."""
+    out: list[tuple[str, datetime]] = []
+    day: str | None = None
+    for r in rows:
+        kind = r.get("kind")
+        if kind == "date":
+            m = _DATE_RE.search(r.get("name") or "")
+            day = m.group(0) if m else None
+        elif kind == "content" and r.get("name"):
+            try:
+                # 서버가 전체 시각을 실어 주면 그쪽을 믿는다
+                if r.get("datetime"):
+                    at = datetime.fromisoformat(r["datetime"])
+                elif day and r.get("time"):
+                    at = datetime.fromisoformat(f"{day}T{r['time']}")
+                else:
+                    continue
+            except ValueError:
+                logger.warning("[API] 컨텐츠 시각 파싱 실패: %r", r)
+                continue
+            out.append((r["name"], at))
+    return out
+
 
 class ApiSync:
     """/api/boss-timeline 조회 → 보스별 다음 스폰 시각 dict 생성."""
 
     def __init__(self, client: ApiClient | None = None):
         self.client = client or ApiClient()
+        self._contents: set[tuple[str, datetime]] = set()
+
+    def content_times(self, name: str) -> list[datetime]:
+        """마지막 동기화까지 알게 된 이 컨텐츠의 시작 시각들 (지난 회차 포함, 오름차순)."""
+        return sorted(at for n, at in set(self._contents) if n == name)
 
     def fetch_all(self) -> dict[str, object]:
         payload = self.client.get_json(_TIMELINE_PATH)
-        entries = [e for e in (payload or {}).get("bosses", [])
-                   if e.get("kind") == "boss"]
+        rows = (payload or {}).get("bosses", [])
+
+        cutoff = datetime.now() - CONTENT_KEEP
+        # 통째로 바꿔 끼운다 — GUI 스레드가 content_times 로 읽는 중일 수 있다
+        self._contents = {c for c in self._contents | set(parse_contents(rows))
+                          if c[1] >= cutoff}
+
+        entries = [e for e in rows if e.get("kind") == "boss"]
 
         # API 이름별로 집계: 출현중 여부 + 스폰 시각 목록(보스당 여러 날치)
         agg: dict[str, dict] = defaultdict(lambda: {"live": False, "times": []})

@@ -21,7 +21,6 @@ from datetime import datetime, timedelta
 import cv2
 import mss
 import numpy as np
-from PIL import Image
 from PySide6.QtCore import QObject, Signal, Slot
 
 from odin.automation.automation_config import (
@@ -31,7 +30,8 @@ from odin.boss.boss_config import TAB_BOSS_MAP, TAB_TIME_COORDS
 from odin.game.game_coords import (
     find_game_window, scale_xy,
     click_game, click_base, click_at_screen, center_to_abs_region,
-    scroll_wheel_down,
+    scroll_wheel_down, grab_base, base_offset_to_abs, scale_w, scale_h, ui,
+    ensure_game_foreground,
 )
 from odin.core.models import BossState
 from odin.game.ocr_engine import ocr_text
@@ -77,7 +77,9 @@ BOSS_MOVE_5_CENTER = (990, 585)
 BOSS_MOVE_5_W = 120
 BOSS_MOVE_5_H = 80
 
-MOVE_IMAGE_THRESHOLD = 0.7
+# 4K 실측: 버튼 있을 때 0.70~0.95 (중앙 0.78) — 0.7 은 경계라 0.69 로 실패한 적이 있다.
+# 버튼 없을 때는 최고 0.44.
+MOVE_IMAGE_THRESHOLD = 0.62
 MOVE_IMAGE_TIMEOUT = 10.0      # 이미지 나타날 때까지 최대 대기 (초)
 MOVE_IMAGE_POLL_INTERVAL = 0.3
 
@@ -93,9 +95,21 @@ OCR_UPSCALE = 2
 
 # 각 액션 사이 딜레이
 STEP_DELAY = 0.5
-# 게임 로딩 완료 감지 — camera2.png 가 노출되면 로딩 끝났다고 판정
+# 게임 로딩 완료 감지 — 로딩 화면 오른쪽 아래 'Now Loading' 글자가 떴다가 사라지면 끝.
+# camera2.png 가 보이면 끝으로 치던 예전 판정은 버튼을 누르고 로딩 화면이 늦게 뜨면
+# 출발지 아이콘을 보고 통과했다(10-22 20:01 '0.0s 경과'). 로딩 화면이 안 뜨는 이동에
+# 대비해 LOADING_SCREEN_APPEAR_SEC 안에 글자가 없으면 그때 HUD(HP·MP 바)로 판정한다.
+# camera2.png 는 Q 모드 그림이라 N 모드에선 0.2 대, 4K 에선 Q 모드도 0.35 안팎이라 못 썼다.
+# 녹화 20261018_195849: 글자 점수 로딩 중 0.96~1.00(페이드 인 몇 장만 0.2~0.4), 그 밖 0.42 이하.
+LOADING_SCREEN_IMAGE = "now_loading.png"
+LOADING_SCREEN_CENTER = (1830, 962)  # 글자는 BASE x 1786~1887, y 953~977
+LOADING_SCREEN_W, LOADING_SCREEN_H = 160, 70
+LOADING_SCREEN_THRESHOLD = 0.7
+LOADING_SCREEN_APPEAR_SEC = 8.0      # 녹화에선 버튼 0.5초 뒤, 늦을 땐 3초 넘게
+LOADING_SCREEN_MAX_SEC = 40.0        # 로딩 화면이 이보다 길면 그냥 진행 (보통 5~13초)
+LOADING_SCREEN_GONE_SAMPLES = 2      # 페이드 인 중 한두 장 낮게 읽히는 걸 끝으로 읽지 않게
 # (CAMERA_CHECK_* 상수는 _run_camera_check 정의부 근처에 위치)
-LOADING_DETECT_TIMEOUT_SEC = 15.0    # 그 안에 안 뜨면 폴백으로 그냥 진행
+LOADING_DETECT_TIMEOUT_SEC = 15.0    # camera2 폴백 — 그 안에 안 뜨면 그냥 진행
 LOADING_DETECT_INTERVAL = 0.3
 LOADING_DETECT_PRE_DELAY = 0.5       # 로딩 화면이 뜰 시간 확보용 짧은 settle
 POST_LOADING_DELAY_SEC = 2.0         # camera2 감지 직후 settle — 이동 텍스트 안정화 대기
@@ -226,6 +240,11 @@ MINIMAP_STATIC_STREAK_THRESHOLD = 10   # 연속 정지 횟수 (0.5s × 10 = 5.0�
 # 빠른 판정에서 'm 사라짐' 으로 간주하기 전 연속 미검출 필요 횟수.
 # OCR 한 번 글리치로 사라졌다고 즉시 도착 처리되는 걸 방지.
 M_ABSENT_STREAK_FOR_FAST_PATH = 5      # 0.5s × 5 = 2.5초 연속 미검출
+# 빠른 판정은 이동한 근거(m 을 봤거나 미니맵이 한 번이라도 바뀜)가 있을 때만.
+# 근거 없이 '정지 + m 없음' 만으로 도착 처리하면 출발 전에 서 있는 5초가 도착이 된다 —
+# m 을 한 번도 못 보고 대기 7초 만에 도착 처리 (10-22 굴베이그 13:39, 스바르트 15:44,
+# 토르 00:17). 근거가 끝내 없으면(바로 옆 도착) 대기 시작 후 이 시간이 지나서야 허용.
+FAST_PATH_NO_MOVE_MIN_SEC = 20.0
 
 # === OCR 디버그 저장 ===
 # True 면 _wait_until_arrival 폴링마다 'm' OCR 영역 이미지를 DATA_DIR/ocr_debug 에 저장.
@@ -249,13 +268,12 @@ KEY_GF_DELAY = 0.3
 # camera2.png 와 매칭 점수가 임계값에 도달할 때까지 1초 간격으로 C 키 입력.
 # 최대 CAMERA_CHECK_MAX_ITERS 회 시도 후 타임아웃.
 CAMERA_CHECK_IMAGE = "camera2.png"
-CAMERA_CHECK_CENTER = (30, 441)
+CAMERA_CHECK_CENTER = ui(30, 441, "TL")   # 왼쪽 아이콘열 — 화면 중간 높이여도 위쪽 기준
 CAMERA_CHECK_W = 50
 CAMERA_CHECK_H = 50
 CAMERA_CHECK_THRESHOLD = 0.7
 # 로딩 완료 감지는 아이콘이 보이기만 하면 된다 (모드 무관). 반투명이라 아이콘이 있어도
 # 0.54~0.74 로 흔들려 0.7 이면 자주 놓친다. 아이콘 없는 왼쪽 열은 0.22 이하 (2026-10-17 실측)
-LOADING_ICON_THRESHOLD = 0.5
 # 카메라 보정은 아이콘 안 글자만 따로 보고, Q 글자와 N 글자 중 어느 쪽을 더 닮았는지로
 # 판단한다. 아이콘이 반투명이라 점수 자체가 배경(풀밭/모래)에 따라 크게 흔들려
 # 고정 임계값으로는 구분이 안 됐다 — 통째로: Q 0.695 / N 0.659,
@@ -287,6 +305,7 @@ SKILL_PRESET_KEYS = {p: vk for p, (vk, _name) in PRESET_KEYS.items()}
 
 
 def _press_key(vk_code: int):
+    ensure_game_foreground()
     ctypes.windll.user32.keybd_event(vk_code, 0, 0, 0)          # key down
     time.sleep(0.05)
     ctypes.windll.user32.keybd_event(vk_code, 0, 0x0002, 0)     # key up
@@ -324,17 +343,13 @@ def _match_region(filename: str,
                   bx: int, by: int, cw: int, ch: int,
                   threshold: float
                   ) -> tuple[bool, float, tuple[int, int]]:
-    """BASE 중심/크기 영역 캡처 + 템플릿 매칭.
+    """BASE 중심/크기 영역 캡처 + 템플릿 매칭 (캡처는 BASE 크기로 줄여서 비교).
     반환: (존재여부, max_score, 매칭 중심의 절대 스크린 좌표)
     """
     template = _load_image_template(filename)
     region = _center_to_abs_region(
         center_base, w_base, h_base, bx, by, cw, ch)
-    with mss.mss() as sct:
-        shot = sct.grab(region)
-    img_rgb = np.array(Image.frombytes(
-        "RGB", (shot.width, shot.height), shot.rgb))
-    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    img_bgr = cv2.cvtColor(grab_base(region, cw, ch), cv2.COLOR_RGB2BGR)
     if (img_bgr.shape[0] < template.shape[0]
             or img_bgr.shape[1] < template.shape[1]):
         logger.warning("[자동화] '%s' 탐색영역(%dx%d) < 템플릿(%dx%d)",
@@ -344,9 +359,10 @@ def _match_region(filename: str,
         return False, 0.0, (0, 0)
     result = cv2.matchTemplate(img_bgr, template, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, max_loc = cv2.minMaxLoc(result)
-    abs_cx = region["left"] + max_loc[0] + template.shape[1] // 2
-    abs_cy = region["top"] + max_loc[1] + template.shape[0] // 2
-    return max_val >= threshold, max_val, (abs_cx, abs_cy)
+    abs_xy = base_offset_to_abs(
+        region, (max_loc[0] + template.shape[1] / 2, max_loc[1] + template.shape[0] / 2),
+        cw, ch)
+    return max_val >= threshold, max_val, abs_xy
 
 
 def _find_and_click(filename: str,
@@ -378,6 +394,21 @@ def _find_and_click(filename: str,
     return False
 
 
+def _respawn_if_dead(win, tag: str) -> None:
+    """사망 화면이면 마을에서 부활부터. 추적 중이 아닐 때(아이들 사냥·대기) 죽으면
+    아무도 부활시키지 않아 다음 보스 이동이 시간표 버튼부터 막혔다 (10/30 노트)."""
+    from odin.automation.respawn import is_dead, respawn_in_town
+    try:
+        dead = is_dead(win)
+    except Exception as e:
+        logger.debug("[%s] 사망 확인 실패: %s", tag, e)
+        return
+    if dead:
+        logger.info("[%s] 사망 화면 → 마을에서 부활 먼저", tag)
+        respawn_in_town(win, tag)
+        logger.info("[%s] 마을에서 부활 완료", tag)
+
+
 def _run_sequence(boss: BossState, screen_sync):
     """자동화 시퀀스 — 동기 실행 (공용 큐 워커 스레드에서 호출됨)."""
     # 이전 Ctrl+Esc 요청 리셋 — 이번 시퀀스의 Ctrl+Esc 만 반영
@@ -386,9 +417,11 @@ def _run_sequence(boss: BossState, screen_sync):
                 boss.config.display_name)
 
     try:
-        hwnd, bx, by, cw, ch = _find_game_window()
-        ctypes.windll.user32.SetForegroundWindow(hwnd)
+        win = _find_game_window()
+        hwnd, bx, by, cw, ch = win
+        ensure_game_foreground()
         _sleep_cancellable(STEP_DELAY)
+        _respawn_if_dead(win, "자동화")
 
         # 1) 시간표 열기
         gx, gy = _scale_xy(SCHEDULE_ICON, cw, ch)
@@ -422,6 +455,7 @@ def _run_sequence(boss: BossState, screen_sync):
                 BOSS_MOVE_4_IMAGE,
                 BOSS_MOVE_4_CENTER, BOSS_MOVE_4_W, BOSS_MOVE_4_H,
                 bx, by, cw, ch):
+            _save_idle_debug(win, "move4_fail")
             raise TimeoutError(f"'{BOSS_MOVE_4_IMAGE}' 미감지 — 시퀀스 중단")
 
         # 5) boss_move_5 버튼 이미지 매칭 → 클릭
@@ -434,9 +468,9 @@ def _run_sequence(boss: BossState, screen_sync):
         travel_started = time.time()   # 이동 시작 — 비행 구간 보스의 이동 시간 기준
         _sleep_cancellable(STEP_DELAY)
 
-        # 6) 게임 로딩 완료 감지 — camera2.png 가 노출될 때까지 대기 후 도착 판정 시작
+        # 6) 게임 로딩 완료 감지 — 로딩 화면이 걷힐 때까지 대기 후 도착 판정 시작
         _wait_for_loading_complete(bx, by, cw, ch)
-        # 카메라 노출 직후 캐릭터·UI 가 settle 되도록 추가 대기 (이동 거리 텍스트 안정화)
+        # 로딩 직후 캐릭터·UI 가 settle 되도록 추가 대기 (이동 거리 텍스트 안정화)
         _sleep_cancellable(POST_LOADING_DELAY_SEC)
 
         abs_region = _center_to_abs_region(
@@ -516,10 +550,8 @@ def _ocr_debug_save(img_gray: np.ndarray, m_val: int | None, text: str):
         logger.debug("[OCR디버그] 저장 실패: %s", e)
 
 
-def _capture_gray(sct, abs_region: dict) -> np.ndarray:
-    shot = sct.grab(abs_region)
-    img_rgb = np.array(Image.frombytes(
-        "RGB", (shot.width, shot.height), shot.rgb))
+def _capture_gray(sct, abs_region: dict, cw: int, ch: int) -> np.ndarray:
+    img_rgb = grab_base(abs_region, cw, ch, sct)
     return np.dot(img_rgb[..., :3], [0.299, 0.587, 0.114]).astype(np.uint8)
 
 
@@ -539,9 +571,7 @@ def _capture_minimap_gray(sct, bx: int, by: int, cw: int, ch: int) -> np.ndarray
     """미니맵 영역 캡처 → 그레이스케일 ndarray."""
     region = _center_to_abs_region(
         MINIMAP_CENTER, MINIMAP_W, MINIMAP_H, bx, by, cw, ch)
-    shot = sct.grab(region)
-    img_rgb = np.array(Image.frombytes(
-        "RGB", (shot.width, shot.height), shot.rgb))
+    img_rgb = grab_base(region, cw, ch, sct)
     return np.dot(img_rgb[..., :3], [0.299, 0.587, 0.114]).astype(np.uint8)
 
 
@@ -591,14 +621,14 @@ def _is_minimap_static(prev: np.ndarray, curr: np.ndarray) -> tuple[bool, float]
     return change_pct < MINIMAP_CHANGE_PCT_THRESHOLD, change_pct
 
 
-def _secondary_confirm(sct, abs_region: dict) -> bool:
+def _secondary_confirm(sct, abs_region: dict, cw: int, ch: int) -> bool:
     """Phase 2 확정 후 FINAL_CONFIRM_WAIT_SEC 동안 추가 검증.
     그 동안 m 이 한 번이라도 재등장하면 False 반환 (도착 취소).
     """
     end = time.time() + FINAL_CONFIRM_WAIT_SEC
     while time.time() < end:
         _check_cancel()
-        img_gray = _capture_gray(sct, abs_region)
+        img_gray = _capture_gray(sct, abs_region, cw, ch)
         text = _read_m_region(img_gray)
         if _extract_m_distance(text) is not None:
             logger.info("[자동화] 2차 확인 — m 재등장 (OCR='%s') → 도착 취소", text)
@@ -637,6 +667,7 @@ def _wait_until_arrival(abs_region: dict,
     last_zoom = 0.0
     prev_minimap: np.ndarray | None = None
     minimap_static_streak = 0
+    minimap_moved = False  # 미니맵이 한 번이라도 바뀜 = 이동 중이었다
     m_absent_streak = 0    # 빠른 판정에서 OCR 글리치 방지용 연속 미검출 카운터
     _ocr_debug_prepare()   # 디버그 디렉토리 준비 + 오래된 파일 정리
 
@@ -654,7 +685,7 @@ def _wait_until_arrival(abs_region: dict,
                 raise TimeoutError(
                     f"도착 대기 {max_wait}초 초과 (phase={phase})"
                 )
-            img_gray = _capture_gray(sct, abs_region)
+            img_gray = _capture_gray(sct, abs_region, cw, ch)
             text = _read_m_region(img_gray)
             m_val = _extract_m_distance(text)
             has_m = m_val is not None
@@ -681,6 +712,7 @@ def _wait_until_arrival(abs_region: dict,
                         minimap_static_streak += 1
                     else:
                         minimap_static_streak = 0
+                        minimap_moved = True
                     # 비행 구간 보스는 나는 동안에도 미니맵이 바뀌는지 확인하려고 5초마다 남긴다
                     log = logger.info if flying_route and int(elapsed * 2) % 10 == 0 else logger.debug
                     log("[미니맵] (%.0fs, 이동 %.0fs) change=%.2f%% static_streak=%d/%d "
@@ -695,15 +727,20 @@ def _wait_until_arrival(abs_region: dict,
                     travel = time.time() - travel_started
                     landed_by_time = (not flying_route
                                       or travel >= FLYING_ROUTE_MIN_TRAVEL_SEC)
-                    # 미니맵 정지 + (m 연속 미검출 OR m 근거리) → 즉시 도착
-                    if (landed_by_time
+                    moved = (m_seen_once or has_m or minimap_moved
+                             or elapsed >= FAST_PATH_NO_MOVE_MIN_SEC)
+                    # 이동 근거 + 미니맵 정지 + (m 연속 미검출 OR m 근거리) → 즉시 도착
+                    if (landed_by_time and moved
                             and minimap_static_streak >= MINIMAP_STATIC_STREAK_THRESHOLD
                             and (m_gone_confirmed or m_near)):
                         logger.info(
-                            "[자동화] 도착 빠른 판정 — 미니맵 %d회 정지 + m %s",
+                            "[자동화] 도착 빠른 판정 — 미니맵 %d회 정지 + m %s (이동 근거: %s)",
                             minimap_static_streak,
                             f"{m_absent_streak}회 미검출" if m_gone_confirmed
-                            else f"{m_val}m")
+                            else f"{m_val}m",
+                            "m" if m_seen_once or has_m
+                            else "미니맵" if minimap_moved
+                            else f"없음, {elapsed:.0f}s 경과")
                         return
                 if curr_minimap is not None:
                     prev_minimap = curr_minimap
@@ -763,7 +800,7 @@ def _wait_until_arrival(abs_region: dict,
                     logger.info(
                         "[자동화] Phase 2 통과 — 2차 확인 시작 (%.1fs 추가 검증)",
                         FINAL_CONFIRM_WAIT_SEC)
-                    if _secondary_confirm(sct, abs_region):
+                    if _secondary_confirm(sct, abs_region, cw, ch):
                         logger.info("[자동화] 2차 확인 통과 → 도착 확정")
                         return
                     # 2차 확인 실패 → Phase 2 계속
@@ -842,10 +879,11 @@ _auto_template_cache: np.ndarray | None = None
 
 # 아이들 모드에서 사용할 아이템 후보 — name → BASE 좌표
 IDLE_ITEMS: dict[str, tuple[int, int]] = {
-    "마석팔찌": (322, 455),
-    "태숭장":   (322, 510),
-    "태숭활":   (322, 565),
-    "불사망":   (322, 734),
+    # 왼쪽 메뉴(IDLE_CLICK_1)에서 펼쳐지는 목록 — 왼쪽 위 기준 (4K 미확인)
+    "마석팔찌": ui(322, 455, "TL"),
+    "태숭장":   ui(322, 510, "TL"),
+    "태숭활":   ui(322, 565, "TL"),
+    "불사망":   ui(322, 734, "TL"),
 }
 DEFAULT_IDLE_ITEM = "태숭장"
 
@@ -889,11 +927,7 @@ def _auto_image_present(bx: int, by: int, cw: int, ch: int) -> tuple[bool, float
     template = _load_auto_template()
     region = _center_to_abs_region(
         AUTO_IMAGE_CENTER, AUTO_IMAGE_W, AUTO_IMAGE_H, bx, by, cw, ch)
-    with mss.mss() as sct:
-        shot = sct.grab(region)
-    img_rgb = np.array(Image.frombytes(
-        "RGB", (shot.width, shot.height), shot.rgb))
-    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    img_bgr = cv2.cvtColor(grab_base(region, cw, ch), cv2.COLOR_RGB2BGR)
     if (img_bgr.shape[0] < template.shape[0]
             or img_bgr.shape[1] < template.shape[1]):
         logger.warning("[아이들] 탐색 영역(%dx%d)이 템플릿(%dx%d)보다 작음",
@@ -931,7 +965,7 @@ def _wait_for_auto_image(bx: int, by: int, cw: int, ch: int) -> bool:
 def _run_idle_sequence(screen_sync=None):
     """여유 시간에 실행할 아이들 시퀀스.
     1) (IDLE_CLICK_1) 클릭 → 2) 1s → 3) 선택된 아이템 클릭
-    → 4) auto 이미지 감지 대기 → 5) 감지되면 AUTO 위치 클릭.
+    → 4) 순간이동 로딩이 걷히길 대기 → 5) AUTO 링이 꺼져 있으면 G.
     """
     # 이전 Ctrl+Esc 요청 리셋 — 이번 시퀀스의 Ctrl+Esc 만 반영
     _cancel_event.clear()
@@ -943,58 +977,208 @@ def _run_idle_sequence(screen_sync=None):
         item_xy = IDLE_ITEMS[DEFAULT_IDLE_ITEM]
 
     logger.info("[아이들] 시퀀스 시작 (아이템: %s)", item_name)
-    hwnd, bx, by, cw, ch = _find_game_window()
-    ctypes.windll.user32.SetForegroundWindow(hwnd)
+    win = _find_game_window()
+    hwnd, bx, by, cw, ch = win
+    ensure_game_foreground()
     _sleep_cancellable(0.3)
+    _respawn_if_dead(win, "아이들")
+
+    # 사냥 프리셋으로 — 옵션의 아이들 프리셋
+    from odin.automation.automation_config import get_idle_preset
+    idle_preset = get_idle_preset()
+    vk = SKILL_PRESET_KEYS.get(idle_preset)
+    if vk is not None:
+        _press_key(vk)
+        logger.info("[아이들] 아이들 프리셋 '%s' 키 입력", idle_preset)
+        _sleep_cancellable(0.3)
 
     _click_game_base(IDLE_CLICK_1, bx, by, cw, ch)
     _sleep_cancellable(1.0)
     _click_game_base(item_xy, bx, by, cw, ch)
 
-    # auto 아이콘 등장 대기 — 뜨면 UI 안정화 후 AUTO 위치 클릭, 타임아웃이면 그냥 종료
-    auto_detected = _wait_for_auto_image(bx, by, cw, ch)
-    if auto_detected:
-        _sleep_cancellable(1.5)              # UI 트랜지션 안정화
-        _click_game_base(AUTO_CLICK_POS, bx, by, cw, ch)
-        logger.info("[아이들] AUTO 위치 클릭 완료 (BASE %s)", AUTO_CLICK_POS)
-    else:
-        logger.warning("[아이들] auto 미감지 → 시퀀스 종료")
+    # 순간이동이 끝나면 AUTO 가 꺼진다 — 로딩이 걷힌 뒤 AUTO 링을 보고 꺼져 있으면 G.
+    # 예전엔 꺼진 AUTO 버튼 그림(auto.png)이 뜨길 기다렸는데 4K 로 바꾼 뒤 10/30 하루
+    # 10번 모두 못 찾아 그대로 서 있었다. 링 밝기는 발할라·월보에서 4K 로도 잘 읽힌다.
+    _wait_for_loading_complete(bx, by, cw, ch)
+    _sleep_cancellable(1.5)   # 로딩 글자가 사라지고도 잠깐 HUD 가 안 보인다
+    _wait_for_hud(win)
+    _ensure_auto_on(win)
     logger.info("[아이들] 시퀀스 완료")
 
 
+IDLE_AUTO_SAMPLES = 6        # AUTO 링은 효과에 가려 한 장으론 0 일 때가 있다 — 여러 장 중 최댓값
+IDLE_AUTO_SAMPLE_GAP = 0.4
+IDLE_AUTO_TRIES = 3
+# 필드 HUD 판정 = 왼쪽 위 HP(빨강)·MP(파랑) 바의 왼쪽 끝. AUTO·카메라 상태와 무관하다.
+# 예전 판정(AUTO 링 또는 카메라 막대)은 AUTO 꺼짐 + 막대 못 읽음일 때 멀쩡한 화면을 HUD
+# 없음으로 봤다 (11/05 01:41 캡처, 11/03 이후 막대 판독 99번 중 85번 실패).
+# 녹화 281장: 로딩 프레임 8장 모두 없음, 없음 판정 표본 16장은 메뉴·사망·워프·컷신뿐.
+HUD_HP_CENTER = ui(24, 20, "TL")
+HUD_MP_CENTER = ui(24, 39, "TL")
+HUD_BAR_W, HUD_BAR_H = 12, 7
+HUD_CONFIRM = 2              # 연속으로 이만큼 — 페이드 중 한 장에 속지 않게
+# 시퀀스 끝에서 HUD 를 기다리는 시간. 지나도 안 보이면 그래도 AUTO 를 확인한다
+# (HUD 를 잘못 읽어 사냥을 못 하는 쪽이 더 나쁘다).
+IDLE_HUD_WAIT_SEC = 60.0
+IDLE_HUD_POLL_SEC = 0.5
+IDLE_DEBUG_DIR = DATA_DIR / "idle_debug"
+IDLE_DEBUG_KEEP = 30
+
+
+def _hud_shown(bx: int, by: int, cw: int, ch: int) -> bool:
+    """필드 HUD 가 보이는가 — HP·MP 바 색. 메뉴·로딩·사망·컷신에선 없다."""
+    def median_rgb(center):
+        region = center_to_abs_region(center, HUD_BAR_W, HUD_BAR_H, bx, by, cw, ch)
+        return np.median(grab_base(region, cw, ch).reshape(-1, 3), axis=0)
+    try:
+        r, g, b = median_rgb(HUD_HP_CENTER)
+        if not (r >= 110 and r - g >= 70 and r - b >= 70):
+            return False
+        r, _g, b = median_rgb(HUD_MP_CENTER)
+        return bool(b >= 90 and b - r >= 50)
+    except Exception as e:
+        logger.debug("[HUD] 판정 실패: %s", e)
+        return False
+
+
+def _wait_for_hud(win) -> bool:
+    """HUD 가 보일 때까지 키 입력 없이 기다린다. 반환: 봤는지."""
+    _hwnd, bx, by, cw, ch = win
+    start = time.time()
+    hits = 0
+    hidden_saved = False
+    while True:
+        _check_cancel()
+        hits = hits + 1 if _hud_shown(bx, by, cw, ch) else 0
+        if hits >= HUD_CONFIRM:
+            waited = time.time() - start
+            if waited >= 2.0:
+                logger.info("[아이들] HUD 복귀 (%.0fs 대기)", waited)
+            return True
+        if hits == 0 and not hidden_saved:
+            hidden_saved = True
+            _save_idle_debug(win, "hidden")
+        if time.time() - start >= IDLE_HUD_WAIT_SEC:
+            _save_idle_debug(win, "timeout")
+            logger.warning("[아이들] HUD 가 %.0fs 안에 안 보임 — 그래도 AUTO 확인, 화면 저장: %s",
+                           IDLE_HUD_WAIT_SEC, IDLE_DEBUG_DIR)
+            return False
+        _sleep_cancellable(IDLE_HUD_POLL_SEC)
+
+
+def _save_idle_debug(win, label: str) -> None:
+    """판정이 애매할 때의 게임 화면을 절반 크기로 저장 — 어떤 화면이었는지 확인용."""
+    _hwnd, bx, by, cw, ch = win
+    try:
+        IDLE_DEBUG_DIR.mkdir(exist_ok=True)
+        with mss.mss() as sct:
+            shot = sct.grab({"left": bx, "top": by, "width": cw, "height": ch})
+        img = np.frombuffer(shot.rgb, np.uint8).reshape(shot.height, shot.width, 3)
+        small = cv2.resize(img[..., ::-1], None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+        name = f"{datetime.now():%Y%m%d_%H%M%S}_{label}.jpg"
+        cv2.imwrite(str(IDLE_DEBUG_DIR / name), small, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        for old in sorted(IDLE_DEBUG_DIR.glob("*.jpg"))[:-IDLE_DEBUG_KEEP]:
+            old.unlink()
+    except Exception as e:
+        logger.debug("[아이들] 화면 저장 실패: %s", e)
+
+
+def _auto_ring_max(win) -> float:
+    from odin.automation.valhalla import AUTO_RING_MIN, _auto_ratio
+    best = 0.0
+    for _ in range(IDLE_AUTO_SAMPLES):
+        best = max(best, _auto_ratio(win))
+        if best >= AUTO_RING_MIN:
+            break
+        _sleep_cancellable(IDLE_AUTO_SAMPLE_GAP)
+    return best
+
+
+def _ensure_auto_on(win) -> bool:
+    """AUTO 가 꺼져 있으면 G — 켜진 걸 확인할 때까지 몇 번. 반환: 켜짐 확인 여부."""
+    from odin.automation.valhalla import AUTO_RING_MIN
+    for attempt in range(IDLE_AUTO_TRIES):
+        ring = _auto_ring_max(win)
+        if ring >= AUTO_RING_MIN:
+            logger.info("[아이들] AUTO 켜짐 (링 %.2f)", ring)
+            return True
+        _press_key(_VK_G)
+        logger.info("[아이들] AUTO 꺼짐 (링 %.2f) → G (%d회차)", ring, attempt + 1)
+        _sleep_cancellable(1.0)
+    ring = _auto_ring_max(win)
+    if ring >= AUTO_RING_MIN:
+        logger.info("[아이들] AUTO 켜짐 (링 %.2f)", ring)
+        return True
+    _save_idle_debug(win, "auto_fail")
+    logger.warning("[아이들] AUTO 를 켰는지 확인 못 함 (링 %.2f)", ring)
+    return False
+
+
+def _loading_screen_score(bx: int, by: int, cw: int, ch: int) -> float:
+    try:
+        _present, score, _ = _match_region(
+            LOADING_SCREEN_IMAGE, LOADING_SCREEN_CENTER,
+            LOADING_SCREEN_W, LOADING_SCREEN_H, bx, by, cw, ch,
+            LOADING_SCREEN_THRESHOLD)
+    except Exception as e:
+        logger.debug("[로딩감지] 로딩 화면 매칭 실패: %s", e)
+        return 0.0
+    return score
+
+
 def _wait_for_loading_complete(bx: int, by: int, cw: int, ch: int) -> bool:
-    """게임 로딩 완료 감지 — camera2.png 가 화면에 나타날 때까지 폴링.
-    클릭/키 입력 없이 패시브로 매칭만 수행 (idle 의 _run_camera_check 와 다름).
+    """게임 로딩 완료 감지 — 이동·부활 버튼을 누른 직후에 부른다.
+    로딩 화면('Now Loading')이 떴다가 사라질 때까지. 글자가 안 보이면 필드 HUD(HP·MP 바)로.
+    클릭/키 입력 없이 패시브로 매칭만 수행.
     반환: True=감지, False=타임아웃 폴백.
     """
-    # 로딩 화면이 올라올 시간을 잠깐 줌 — 이전 화면의 camera2 가 아직 떠 있을 수 있음
     _sleep_cancellable(LOADING_DETECT_PRE_DELAY)
-    logger.info("[자동화] 게임 로딩 완료 대기 (camera2.png 노출 감시, 최대 %.0fs)",
-                LOADING_DETECT_TIMEOUT_SEC)
+    logger.info("[자동화] 게임 로딩 완료 대기 (로딩 화면 감시, %.0fs 안에 안 뜨면 HUD 로 판정)",
+                LOADING_SCREEN_APPEAR_SEC)
     start = time.time()
+    shown_at: float | None = None
+    gone = 0
     best = 0.0
+    hud_lost_at: float | None = None
+    saved = False
+    while shown_at is not None or time.time() - start < LOADING_SCREEN_APPEAR_SEC:
+        _check_cancel()
+        score = _loading_screen_score(bx, by, cw, ch)
+        best = max(best, score)
+        if score >= LOADING_SCREEN_THRESHOLD:
+            shown_at = shown_at or time.time()
+            gone = 0
+        elif shown_at is not None:
+            gone += 1
+            if gone >= LOADING_SCREEN_GONE_SAMPLES:
+                logger.info("[자동화] 로딩 완료 감지 (로딩 화면 %.1fs, 뜨기까지 %.1fs)",
+                            time.time() - shown_at, shown_at - start)
+                return True
+        elif not _hud_shown(bx, by, cw, ch):
+            # 글자는 안 읽히는데 HUD 가 사라졌다 — 그때 화면을 남겨 왜 못 읽는지 본다
+            hud_lost_at = hud_lost_at or time.time()
+            if not saved and time.time() - hud_lost_at >= 1.0:
+                saved = True
+                _save_idle_debug((0, bx, by, cw, ch), "loading")
+        if shown_at is not None and time.time() - shown_at > LOADING_SCREEN_MAX_SEC:
+            logger.warning("[자동화] 로딩 화면이 %.0fs 넘게 안 걷힘 → 그대로 도착 대기 진입",
+                           LOADING_SCREEN_MAX_SEC)
+            return False
+        _sleep_cancellable(LOADING_DETECT_INTERVAL)
+
+    logger.info("[자동화] 로딩 글자 안 보임 (최고 %.2f, HUD %s) → HUD 감시 (최대 %.0fs)",
+                best, "사라진 적 있음" if hud_lost_at else "계속 보임", LOADING_DETECT_TIMEOUT_SEC)
+    start = time.time()
+    hits = 0
     while time.time() - start < LOADING_DETECT_TIMEOUT_SEC:
         _check_cancel()
-        try:
-            present, score, _ = _match_region(
-                CAMERA_CHECK_IMAGE,
-                CAMERA_CHECK_CENTER, CAMERA_CHECK_W, CAMERA_CHECK_H,
-                bx, by, cw, ch,
-                LOADING_ICON_THRESHOLD)
-        except Exception as e:
-            logger.debug("[로딩감지] 매칭 실패: %s", e)
-            _sleep_cancellable(LOADING_DETECT_INTERVAL)
-            continue
-        if score > best:
-            best = score
-        if present:
-            logger.info("[자동화] 로딩 완료 감지 (camera2 score=%.2f, %.1fs 경과)",
-                        score, time.time() - start)
+        hits = hits + 1 if _hud_shown(bx, by, cw, ch) else 0
+        if hits >= HUD_CONFIRM:
+            logger.info("[자동화] 로딩 완료 감지 (HUD, %.1fs 경과)", time.time() - start)
             return True
         _sleep_cancellable(LOADING_DETECT_INTERVAL)
-    logger.warning(
-        "[자동화] 로딩 완료 미감지 — %.0fs 타임아웃 (최고 score=%.2f) → 그대로 도착 대기 진입",
-        LOADING_DETECT_TIMEOUT_SEC, best)
+    logger.warning("[자동화] 로딩 완료 미감지 — %.0fs 동안 HUD 안 보임 → 그대로 도착 대기 진입",
+                   LOADING_DETECT_TIMEOUT_SEC)
     return False
 
 
@@ -1056,11 +1240,14 @@ def _camera_letter_score(bx: int, by: int, cw: int, ch: int
         bx, by, cw, ch, CAMERA_CHECK_THRESHOLD)
     th, tw = template.shape[:2]
     pad = _CAMERA_LETTER_PAD
-    with mss.mss() as sct:
-        shot = sct.grab({"left": ax - tw // 2 - pad, "top": ay - th // 2 - pad,
-                         "width": tw + pad * 2, "height": th + pad * 2})
-    crop = cv2.cvtColor(np.array(Image.frombytes(
-        "RGB", (shot.width, shot.height), shot.rgb)), cv2.COLOR_RGB2GRAY)
+    # 아이콘 중심(실제 좌표) 둘레를 BASE 크기 기준 템플릿 + 여유만큼 잘라 BASE 로 줄인다
+    w, h = tw + pad * 2, th + pad * 2
+    rw, rh = scale_w(w, cw), scale_h(h, ch)
+    crop_rgb = grab_base({"left": ax - rw // 2, "top": ay - rh // 2,
+                          "width": rw, "height": rh}, cw, ch)
+    if crop_rgb.shape[:2] != (h, w):
+        crop_rgb = cv2.resize(crop_rgb, (w, h), interpolation=cv2.INTER_AREA)
+    crop = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
     q, n = _camera_letter_scores(crop)
     bar, _lit, _second = _camera_bar_mode(crop)
     return q, n, icon_score, bar
@@ -1122,8 +1309,19 @@ CHAIN_GAP_SEC = 60.0
 # 않는다. 녹화(10-18): 매칭 95초 + 입장~결과 140초(목표 킬 조기 종료) + 복귀 15초.
 # 경기는 최대 5분이라 매칭 2분 + 카운트다운 + 5분 + 복귀로 잡는다.
 VALHALLA_RUN_EST_SEC = 8 * 60
-VALHALLA_CHECK_INTERVAL_SEC = 20.0   # 등록 여부 화면 확인 주기
-VALHALLA_RETRY_AFTER_SEC = 120.0     # 한 번 돌린 뒤 다시 확인하기까지
+# 일정 시각부터 참가를 시도하는 시간. 실제 등록 마감은 아직 모른다 — 녹화(10-18)에선
+# 18:00 회차에 18:15 에도 등록이 열려 있었다. 마감 뒤엔 참가 아이콘이 없어 실패로 끝난다.
+VALHALLA_WINDOW_SEC = 30 * 60
+VALHALLA_RETRY_AFTER_SEC = 120.0     # 참가 실패 뒤 다시 시도하기까지
+
+# 월드보스 — 정각 출현. 녹화(10-18)에선 출현 68초 전에 첫 보스로 순간이동했다.
+# 필드 보스보다 우선이라, 시작 시각이 되면 진행 중인 보스 자동화를 끊고 들어간다.
+WORLD_BOSS_LEAD_SEC = 90.0
+WORLD_BOSS_WINDOW_SEC = 15 * 60      # 출현 뒤 이만큼 지나면 그 회차는 포기 (보스는 1시간 산다)
+WORLD_BOSS_RETRY_AFTER_SEC = 60.0
+
+# 필드 보스 추적 중 사망 → 마을에서 부활. 컨텐츠 이름으로 큐에 올린다 ('content:부활').
+RESPAWN_CONTENT = "부활"
 
 
 class BossAutomator(QObject):
@@ -1152,6 +1350,20 @@ class BossAutomator(QObject):
 
     # 보스 이동 자동화 시작 시점 emit — GUI 방문 기록 탭 업데이트용. arg: 저장된 엔트리(dict).
     boss_visited = Signal(dict)
+    # IDLE 로 들어올 때마다 emit (다른 상태에서 바뀌었거나 시작·초기화). arg: 이유.
+    # 경험치 추정이 사냥 구간을 새로 시작하는 데 쓴다.
+    idle_entered = Signal(str)
+
+    @property
+    def _state(self) -> str:
+        return self.__dict__.get("_state_value", self.STATE_IDLE)
+
+    @_state.setter
+    def _state(self, value: str) -> None:
+        old = self.__dict__.get("_state_value")
+        self.__dict__["_state_value"] = value
+        if value == self.STATE_IDLE and old is not None and old != value:
+            self.idle_entered.emit(f"{old} → IDLE")
 
     def __init__(self, screen_sync, game_queue,
                  presence_monitor=None,
@@ -1173,13 +1385,18 @@ class BossAutomator(QObject):
         self._current_boss: BossState | None = None
         self._current_content: str | None = None
         self._idle_action_submitted = False  # 현재 IDLE 기간에 아이들 액션 이미 돌렸는지
-        # 발할라 대전 자동 참가 (check_valhalla). GUI 체크박스로 on/off.
+        # 일정 컨텐츠 자동화 (check_valhalla · check_world_boss). GUI 체크박스로 on/off.
         self.valhalla_auto = True
-        self._valhalla_next_check = 0.0
-        self._valhalla_waiting_logged = False
+        self.world_boss_auto = True
+        # 회차 = (컨텐츠 이름, 시작 시각). 끝까지 치른 회차는 다시 들어가지 않는다.
+        self._content_done: set[tuple[str, datetime]] = set()
+        self._content_slot: tuple[str, datetime] | None = None   # 지금 도는 회차
+        self._content_retry_at: dict[str, float] = {}             # 실패 뒤 재시도 시각
+        self._valhalla_waiting_logged: datetime | None = None   # '보스 먼저' 로그는 회차당 한 번
 
         if presence_monitor is not None:
             presence_monitor.ended.connect(self._on_boss_ended)
+            presence_monitor.died.connect(self._on_died)
         if game_queue is not None:
             game_queue.task_finished.connect(self._on_task_finished)
             game_queue.task_failed.connect(self._on_task_failed)
@@ -1213,6 +1430,10 @@ class BossAutomator(QObject):
         self._current_boss = None
         self._current_content = None
         self._idle_action_submitted = False
+        # 사람이 멈춘 회차(Ctrl+Esc·초기화)는 다시 들어가지 않는다
+        if self._content_slot is not None:
+            self._content_done.add(self._content_slot)
+            self._content_slot = None
         if self.presence_monitor is not None:
             try:
                 self.presence_monitor.stop_tracking()
@@ -1221,6 +1442,9 @@ class BossAutomator(QObject):
         logger.info(
             "[자동화] 상태 초기화: %s('%s') → IDLE (대기열 %d개 비움)",
             old_state, old_boss_name, pending_count)
+        if old_state == self.STATE_IDLE:
+            # 상태는 그대로라 setter 가 알리지 않는다 — 시작·중지 사이에 사람이 옮겼을 수 있다
+            self.idle_entered.emit("시작·초기화")
 
     def _on_esc_pressed(self):
         """Ctrl+Esc → 상태 강제 초기화."""
@@ -1245,39 +1469,84 @@ class BossAutomator(QObject):
         self.game_queue.submit(f"content:{name}", func)
         return True
 
-    def check_valhalla(self, next_soon_sec: float | None):
+    def check_valhalla(self, next_soon_sec: float | None, slots: list[datetime]):
         """발할라 대전 자동 참가 — 보스가 우선이다. 스케줄러가 tick마다 호출.
 
-        참가 조건: IDLE · 보류 보스 없음 · 다음 보스 출발(SOON)까지 한 판이 끝날 여유
-        · 화면에 참가 등록이 열려 있음(흰 카운트다운). 등록 시간은 일정표 대신 화면으로
-        판단한다 — 보스가 비는 순간이 등록 시간 안이기만 하면 그때 들어간다.
+        slots: 보드 일정 API 의 '발할라 대전' 시작 시각들. 시작 시각부터
+        VALHALLA_WINDOW_SEC 안이 참가 시간이다. 그 안에서
+        IDLE · 보류 보스 없음 · 다음 보스 출발(SOON)까지 한 판이 끝날 여유가 있는
+        첫 순간에 들어간다. 한 회차는 한 번만 — 참가가 실패하면(등록 아이콘 없음 등)
+        VALHALLA_RETRY_AFTER_SEC 뒤 다시 시도한다.
         """
         if not self.valhalla_auto or self.game_queue is None:
             return
+        now = datetime.now()
+        window = timedelta(seconds=VALHALLA_WINDOW_SEC)
+        slot = next((s for s in reversed(slots)
+                     if s <= now < s + window
+                     and ("발할라 대전", s) not in self._content_done), None)
+        if slot is None:
+            return
         if self._state != self.STATE_IDLE or self._pending:
-            return
-        now = time.time()
-        if now < self._valhalla_next_check:
-            return
-        self._valhalla_next_check = now + VALHALLA_CHECK_INTERVAL_SEC
-
-        from odin.automation.valhalla import registration_open, run_valhalla
-        if not registration_open():
-            self._valhalla_waiting_logged = False
+            return   # 보스 진행 중 — 끝나고 IDLE 로 돌아오면 다시 본다
+        if time.time() < self._content_retry_at.get("발할라 대전", 0.0):
             return
         if next_soon_sec is not None and next_soon_sec < VALHALLA_RUN_EST_SEC:
-            if not self._valhalla_waiting_logged:
+            if self._valhalla_waiting_logged != slot:
                 logger.info(
-                    "[발할라] 등록 열림 — 다음 보스 출발까지 %.1f분 < 한 판 %.0f분, 보스 먼저",
-                    next_soon_sec / 60, VALHALLA_RUN_EST_SEC / 60)
-                self._valhalla_waiting_logged = True
+                    "[발할라] %s 회차 — 다음 보스 출발까지 %.1f분 < 한 판 %.0f분, 보스 먼저",
+                    slot.strftime("%H:%M"), next_soon_sec / 60, VALHALLA_RUN_EST_SEC / 60)
+                self._valhalla_waiting_logged = slot
             return
-        self._valhalla_waiting_logged = False
-        logger.info("[발할라] 등록 열림 · 다음 보스 출발까지 %s → 자동 참가",
+        logger.info("[발할라] %s 회차 · 다음 보스 출발까지 %s → 참가",
+                    slot.strftime("%H:%M"),
                     "없음" if next_soon_sec is None else f"{next_soon_sec / 60:.1f}분")
+        from odin.automation.valhalla import run_valhalla
         if self.run_content("발할라 대전", run_valhalla):
-            # 실패로 끝나도 바로 다시 들이밀지 않게
-            self._valhalla_next_check = now + VALHALLA_RETRY_AFTER_SEC
+            self._content_slot = ("발할라 대전", slot)
+            self._content_retry_at["발할라 대전"] = time.time() + VALHALLA_RETRY_AFTER_SEC
+
+    def check_world_boss(self, slots: list[datetime]):
+        """월드보스 — 필드 보스보다 우선. 스케줄러가 tick마다 호출.
+
+        slots: 보드 일정 API 의 '월드보스' 출현 시각들. 출현 WORLD_BOSS_LEAD_SEC 전부터
+        WORLD_BOSS_WINDOW_SEC 뒤까지가 들어갈 시간이다. 필드 보스로 이동·추적 중이면
+        끊고 들어간다 — 그 보스와 보류 중이던 보스는 대기열에 남아, 끝난 뒤 보류 해제
+        규칙(스폰 지남·촉박 스킵)대로 처리된다. 발할라 대전이 돌고 있으면 기다린다.
+        """
+        if not self.world_boss_auto or self.game_queue is None:
+            return
+        now = datetime.now()
+        lead = timedelta(seconds=WORLD_BOSS_LEAD_SEC)
+        window = timedelta(seconds=WORLD_BOSS_WINDOW_SEC)
+        slot = next((s for s in slots
+                     if s - lead <= now < s + window
+                     and ("월드보스", s) not in self._content_done), None)
+        if slot is None or self._state == self.STATE_CONTENT:
+            return
+        if time.time() < self._content_retry_at.get("월드보스", 0.0):
+            return
+        if self._state != self.STATE_IDLE:
+            self._yield_to_content("월드보스")
+
+        logger.info("[월보] %s 회차 → 시작", slot.strftime("%H:%M"))
+        from odin.automation.world_boss import run_world_boss
+        if self.run_content("월드보스", lambda: run_world_boss(slot)):
+            self._content_slot = ("월드보스", slot)
+            self._content_retry_at["월드보스"] = time.time() + WORLD_BOSS_RETRY_AFTER_SEC
+
+    def _yield_to_content(self, name: str):
+        """진행 중인 필드 보스 자동화를 끊는다. 끊긴 보스는 대기열 맨 앞으로."""
+        boss = self._current_boss
+        logger.info("[자동화] '%s' 우선 — 상태 %s ('%s') 중단",
+                    name, self._state, boss.config.display_name if boss else "-")
+        pending = list(self._pending)
+        if boss is not None and boss not in pending:
+            pending.insert(0, boss)
+        cancel_current()            # 실행 중인 이동 시퀀스는 다음 _check_cancel 에서 끝난다
+        self.game_queue.clear()     # 아직 안 돈 이동·아이들 작업도 버린다
+        self.reset()                # presence 추적 중단 + IDLE
+        self._pending = pending
 
     def _end_content(self, name: str, how: str):
         if self._state != self.STATE_CONTENT:
@@ -1436,7 +1705,18 @@ class BossAutomator(QObject):
                     logger.warning("[카메라] 작업 적재 실패: %s", e)
             return
         if name.startswith("content:"):
+            if self._content_slot is not None:
+                self._content_done.add(self._content_slot)
+                self._content_slot = None
             self._end_content(name[len("content:"):], f"완료 {duration:.0f}s")
+            # 마을에서 부활했으면 갈 보스가 없을 때 바로 사냥터로 — 다음 보스까지
+            # 여유가 짧아도(check_idle_action 의 기준 미달) 마을에 서 있는 것보단 낫다
+            if (name == f"content:{RESPAWN_CONTENT}"
+                    and self._state == self.STATE_IDLE
+                    and not self._idle_action_submitted):
+                self._idle_action_submitted = True
+                logger.info("[아이들] 부활 뒤 → 아이들 시퀀스 적재")
+                self.game_queue.submit("idle_action", _run_idle_sequence)
             return
         if not name.startswith("automation:"):
             return  # sync 등 다른 task 는 무관
@@ -1465,6 +1745,7 @@ class BossAutomator(QObject):
             logger.info("[아이들] 시퀀스 실패: %s", error)
             return
         if name.startswith("content:"):
+            self._content_slot = None   # 회차는 그대로 — 재시도 대상
             self._end_content(name[len("content:"):], f"실패: {error}")
             return
         if not name.startswith("automation:"):
@@ -1497,6 +1778,20 @@ class BossAutomator(QObject):
             self._current_boss = None
             self._idle_action_submitted = False
             self._process_next_pending()
+
+    @Slot(object)
+    def _on_died(self, boss):
+        """보스 추적 중 사망 → 마을에서 부활 → IDLE (갈 보스가 없으면 아이들 시퀀스).
+        부활하는 동안은 컨텐츠처럼 CONTENT — 그사이 SOON 보스는 대기열에 보류된다."""
+        if self._state != self.STATE_TRACKING or boss is not self._current_boss:
+            return
+        logger.info("[자동화] 상태 TRACKING → 부활 ('%s' 에서 사망)",
+                    boss.config.display_name)
+        self._state = self.STATE_IDLE
+        self._current_boss = None
+        from odin.automation.respawn import run_respawn
+        name = boss.config.display_name
+        self.run_content(RESPAWN_CONTENT, lambda: run_respawn(name))
 
     def trigger_idle_action_now(self):
         """GUI에서 아이들 아이템 변경 시 즉시 재실행용."""

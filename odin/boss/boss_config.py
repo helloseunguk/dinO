@@ -6,6 +6,7 @@
 from datetime import timedelta
 
 from odin.core.models import BossConfig
+from odin.game.game_coords import ui
 
 _ALERT = timedelta(minutes=2)
 
@@ -152,3 +153,6 @@ TAB_TIME_COORDS: dict[str, list[tuple[int, int]]] = {
     "던전":       [(687,532), (952,532), (1217,532), (687,752), (952,752), (1217,752)],  # 6개 보스 좌표
     "미드가르드": [(687,532), (952,532), (1217,532), (687,752), (952,752)],  # 5개 (니플하임과 동일)
 }
+# 시간표 창은 화면 가운데 기준
+TAB_TIME_COORDS = {tab: [ui(*xy, "C") for xy in coords]
+                   for tab, coords in TAB_TIME_COORDS.items()}
